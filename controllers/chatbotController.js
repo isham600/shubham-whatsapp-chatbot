@@ -4,7 +4,30 @@ const stringSimilarity = require("string-similarity");
 const axios = require("axios"); // HTTP requests
 const config = require("./config"); // Configurations (e.g., session expiry, base URLs)
 const chatbotService = require('./chatbotService');
-const { v4: uuidv4 } = require('uuid'); // UUID generator
+const redisClient = require("../utils/redis"); // Redis for caching
+
+// Cache TTL: 5 minutes
+const CACHE_TTL = 300;
+
+async function getCachedUsername(sender) {
+  const key = `ci_admin:${sender}`;
+  const cached = await redisClient.get(key);
+  if (cached) return cached;
+  const [rows] = await db.query("SELECT username FROM ci_admin WHERE mobile_no = ?", [sender]);
+  if (rows.length === 0) return null;
+  await redisClient.setex(key, CACHE_TTL, rows[0].username);
+  return rows[0].username;
+}
+
+async function getCachedWati(username) {
+  const key = `wati:${username}`;
+  const cached = await redisClient.get(key);
+  if (cached) return JSON.parse(cached);
+  const [rows] = await db.query("SELECT url, api_key FROM wati WHERE username = ?", [username]);
+  if (rows.length === 0) return null;
+  await redisClient.setex(key, CACHE_TTL, JSON.stringify(rows[0]));
+  return rows[0];
+}
 
 /** ========================================================================
  * ✅ COMPREHENSIVE LOGGING SYSTEM
@@ -14,7 +37,7 @@ const { v4: uuidv4 } = require('uuid'); // UUID generator
  * ✅ Comprehensive logging function for chatbot PM2 logs
  * @param {Object} logData - Logging data object
  */
-async function logToPM2({
+function logToPM2({
   username,
   flowId = null,
   nodeId = null,
@@ -37,46 +60,44 @@ async function logToPM2({
   ipAddress = null,
   userAgent = null
 }) {
-  try {
-    const query = `
-      INSERT INTO chatbot_pm2_logs (
-        username, flow_id, node_id, sender_id, receiver_id, sender_name,
-        log_type, log_level, message, request_payload, response_payload,
-        user_message, bot_response, processing_time, api_endpoint,
-        error_details, session_data, variables_data, metadata,
-        ip_address, user_agent, created_at, updated_at
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NOW(), NOW())
-    `;
+  // Fire-and-forget: never blocks the caller
+  const query = `
+    INSERT INTO chatbot_pm2_logs (
+      username, flow_id, node_id, sender_id, receiver_id, sender_name,
+      log_type, log_level, message, request_payload, response_payload,
+      user_message, bot_response, processing_time, api_endpoint,
+      error_details, session_data, variables_data, metadata,
+      ip_address, user_agent, created_at, updated_at
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NOW(), NOW())
+  `;
 
-    const values = [
-      username,
-      flowId,
-      nodeId,
-      senderId,
-      receiverId,
-      senderName,
-      logType,
-      logLevel,
-      message,
-      requestPayload ? JSON.stringify(requestPayload) : null,
-      responsePayload ? JSON.stringify(responsePayload) : null,
-      userMessage,
-      botResponse,
-      processingTime,
-      apiEndpoint,
-      errorDetails,
-      sessionData ? JSON.stringify(sessionData) : null,
-      variablesData ? JSON.stringify(variablesData) : null,
-      metadata ? JSON.stringify(metadata) : null,
-      ipAddress,
-      userAgent
-    ];
+  const values = [
+    username,
+    flowId,
+    nodeId,
+    senderId,
+    receiverId,
+    senderName,
+    logType,
+    logLevel,
+    message,
+    requestPayload ? JSON.stringify(requestPayload) : null,
+    responsePayload ? JSON.stringify(responsePayload) : null,
+    userMessage,
+    botResponse,
+    processingTime,
+    apiEndpoint,
+    errorDetails,
+    sessionData ? JSON.stringify(sessionData) : null,
+    variablesData ? JSON.stringify(variablesData) : null,
+    metadata ? JSON.stringify(metadata) : null,
+    ipAddress,
+    userAgent
+  ];
 
-    await db.query(query, values);
-    logger.info(`📊 PM2 Log saved: ${logType} - ${message}`);
-  } catch (error) {
+  db.query(query, values).catch(error => {
     logger.error("❌ Failed to save PM2 log:", error.message);
-  }
+  });
 }
 
 /** ========================================================================
@@ -84,19 +105,28 @@ async function logToPM2({
  * ======================================================================== */
 
 exports.handleWebhook = async (req, res) => {
-  const startTime = Date.now();
   const { data } = req.body;
-  const ipAddress = req.ip || req.connection.remoteAddress;
-  const userAgent = req.get('User-Agent');
-  let username = null;
 
-  // ✅ Initial validation
+  // Validate before responding
   if (!data) {
     logger.error("🚫 No data received in the request.");
     return res.status(400).json({ error: "Invalid request. 'data' field is missing." });
   }
 
-  // ✅ Extract sender and message details
+  // ✅ Respond immediately — prevents WhatsApp/WATI from retrying and sending duplicates
+  res.status(200).json({ status: "received" });
+
+  // Process asynchronously in the background
+  const ipAddress = req.ip || req.connection?.remoteAddress;
+  const userAgent = req.get('User-Agent');
+  processWebhookInBackground(data, ipAddress, userAgent)
+    .catch(err => logger.error("❌ Background webhook error:", err.message));
+};
+
+async function processWebhookInBackground(data, ipAddress, userAgent) {
+  const startTime = Date.now();
+  let username = null;
+
   const sender = data.sender_id || "Unknown Sender";
   const receiver = data.waId || "Unknown Receiver";
   const message = data.text || "No Message";
@@ -106,8 +136,7 @@ exports.handleWebhook = async (req, res) => {
   logger.info(`🔹📩 Sender: ${sender}, 📩 Receiver: ${receiver}, 📩 Message: "${message}"`);
 
   try {
-    // ✅ Log webhook received
-    await logToPM2({
+    logToPM2({
       username: 'system',
       senderId: sender,
       receiverId: receiver,
@@ -124,18 +153,14 @@ exports.handleWebhook = async (req, res) => {
       userAgent
     });
 
-    /** ========================================================================
-     * ✅ STEP 0: CLEANUP EXPIRED SESSIONS
-     * ======================================================================== */
-    const [deleteResult] = await db.query("DELETE FROM chatbot_session WHERE expiry_time < NOW()");
-    logger.info(`🗑️ Expired sessions deleted: ${deleteResult.affectedRows}`);
+    // Session cleanup runs via background interval in app.js
 
     /** ========================================================================
-     * ✅ STEP 1: GET USERNAME FROM ci_admin
+     * ✅ STEP 1: GET USERNAME FROM ci_admin (Redis cached)
      * ======================================================================== */
-    const [userRows] = await db.query("SELECT username FROM ci_admin WHERE mobile_no = ?", [sender]);
-    if (userRows.length === 0) {
-      await logToPM2({
+    username = await getCachedUsername(sender);
+    if (!username) {
+      logToPM2({
         username: 'unknown',
         senderId: sender,
         receiverId: receiver,
@@ -146,18 +171,17 @@ exports.handleWebhook = async (req, res) => {
         userMessage: message,
         processingTime: (Date.now() - startTime) / 1000
       });
-      return res.json({ reply: "No matching user found." });
+      return;
     }
 
-    username = userRows[0].username;
     logger.info(`✅ Username found: ${username}`);
 
     /** ========================================================================
-     * ✅ STEP 2: GET WATI API CONFIGURATION
+     * ✅ STEP 2: GET WATI API CONFIGURATION (Redis cached)
      * ======================================================================== */
-    const [watiRows] = await db.query("SELECT url, api_key FROM wati WHERE username = ?", [username]);
-    if (watiRows.length === 0) {
-      await logToPM2({
+    const watiConfig = await getCachedWati(username);
+    if (!watiConfig) {
+      logToPM2({
         username,
         senderId: sender,
         receiverId: receiver,
@@ -168,10 +192,10 @@ exports.handleWebhook = async (req, res) => {
         userMessage: message,
         processingTime: (Date.now() - startTime) / 1000
       });
-      return res.json({ reply: "No WATI configuration found." });
+      return;
     }
 
-    const { url, api_key } = watiRows[0];
+    const { url, api_key } = watiConfig;
     const META_API_URL = `${url}/messages`;
     const ACCESS_TOKEN = api_key;
     logger.info("✅ WATI API configuration loaded successfully.");
@@ -294,16 +318,16 @@ exports.handleWebhook = async (req, res) => {
         if (stepsRows.length > 0) {
           const nodes = JSON.parse(stepsRows[0].nodes || "[]");
           const aiNode = nodes.find(node => node.id === session.source);
-          
+
           if (aiNode && aiNode.type === "ai") {
-            await processAINode(aiNode, receiver, apiUrl, accessToken, session.flow_id, sender, [], sendername, username);
-            return res.json({ reply: "AI response sent" });
+            await processAINode(aiNode, receiver, META_API_URL, ACCESS_TOKEN, session.flow_id, sender, [], sendername, username);
+            return;
           }
         }
-        
+
         // Fallback if AI node not found
-        await sendTextMessage(receiver, "I'm sorry, there was an issue processing your message. Please try again.", apiUrl, accessToken, sender, session.flow_id, sendername);
-        return res.json({ reply: "Fallback message sent" });
+        await sendTextMessage(receiver, "I'm sorry, there was an issue processing your message. Please try again.", META_API_URL, ACCESS_TOKEN, sender, session.flow_id, sendername);
+        return;
       }
 
       // ✅ CASE 4: Question response handling
@@ -335,13 +359,13 @@ exports.handleWebhook = async (req, res) => {
 
         // Determine next node
         let nextNode = null;
-        
+
         // Debug logging for edges
         logger.info(`🔍 Debug - Looking for next node from source: ${session.source}`);
         logger.info(`🔍 Debug - Available sourceHandles: ${JSON.stringify(sessionDetails.sourceHandles, null, 2)}`);
-        
+
         if (!Array.isArray(sessionDetails.sourceHandles) || sessionDetails.sourceHandles.length === 0) {
-          await logToPM2({
+          logToPM2({
             username,
             flowId: session.flow_id,
             nodeId: session.source,
@@ -354,7 +378,7 @@ exports.handleWebhook = async (req, res) => {
             userMessage: message,
             sessionData: session
           });
-          return res.json({ reply: "No valid next step found." });
+          return;
         }
 
         const matchedHandle = sessionDetails.sourceHandles.find(
@@ -366,12 +390,12 @@ exports.handleWebhook = async (req, res) => {
           const fallbackHandle = sessionDetails.sourceHandles.find(
             (handleObj) => handleObj.sourceHandle.includes(session.source)
           );
-          
+
           if (fallbackHandle) {
             nextNode = fallbackHandle.target;
             logger.info(`✅ Found fallback handle for source ${session.source}: ${fallbackHandle.target}`);
           } else {
-            await logToPM2({
+            logToPM2({
               username,
               flowId: session.flow_id,
               nodeId: session.source,
@@ -384,7 +408,7 @@ exports.handleWebhook = async (req, res) => {
               userMessage: message,
               sessionData: session
             });
-            return res.json({ reply: "No valid next step found." });
+            return;
           }
         } else {
           nextNode = matchedHandle.target;
@@ -415,10 +439,10 @@ exports.handleWebhook = async (req, res) => {
             sendername,
             username
           );
-          return res.json({ reply: "Processed question flow." });
+          return;
         }
 
-        await logToPM2({
+        logToPM2({
           username,
           flowId: session.flow_id,
           nodeId: session.source,
@@ -431,81 +455,13 @@ exports.handleWebhook = async (req, res) => {
           userMessage: message,
           sessionData: session
         });
-        return res.json({ reply: "No valid next step found." });
+        return;
       }
     }
 
     // ✅ FALLBACK: No session processed
     if (!processedSession) {
-      // Check if user is requesting UUID summary (8-digit numeric UUID)
-      const uuidPattern = /^\d{8}$/;
-      if (uuidPattern.test(message.trim())) {
-        await logToPM2({
-          username,
-          senderId: sender,
-          receiverId: receiver,
-          senderName: sendername,
-          logType: 'uuid_summary_requested',
-          logLevel: 'info',
-          message: `UUID summary requested: ${message}`,
-          userMessage: message
-        });
-
-        const uuidSummary = await getUUIDSummary(message.trim());
-
-        if (uuidSummary) {
-          await sendTextMessage(
-            receiver,
-            uuidSummary.summary,
-            META_API_URL,
-            ACCESS_TOKEN,
-            sender,
-            null,
-            sendername
-          );
-
-          await logToPM2({
-            username,
-            senderId: sender,
-            receiverId: receiver,
-            senderName: sendername,
-            logType: 'uuid_summary_sent',
-            logLevel: 'info',
-            message: 'UUID summary sent successfully',
-            userMessage: message,
-            metadata: uuidSummary.stats,
-            processingTime: (Date.now() - startTime) / 1000
-          });
-
-          return res.json({ reply: "UUID summary sent." });
-        } else {
-          await sendTextMessage(
-            receiver,
-            `❌ No data found for UUID: ${message.trim()}\n\nPlease check if the UUID is correct or if it has expired.`,
-            META_API_URL,
-            ACCESS_TOKEN,
-            sender,
-            null,
-            sendername
-          );
-
-          await logToPM2({
-            username,
-            senderId: sender,
-            receiverId: receiver,
-            senderName: sendername,
-            logType: 'uuid_not_found',
-            logLevel: 'warning',
-            message: `UUID not found: ${message}`,
-            userMessage: message,
-            processingTime: (Date.now() - startTime) / 1000
-          });
-
-          return res.json({ reply: "UUID not found." });
-        }
-      }
-
-      await logToPM2({
+      logToPM2({
         username,
         senderId: sender,
         receiverId: receiver,
@@ -518,7 +474,7 @@ exports.handleWebhook = async (req, res) => {
 
       const matchedFlow = await findMatchingFlow(message, sender, receiver, username);
       if (matchedFlow) {
-        await logToPM2({
+        logToPM2({
           username,
           flowId: matchedFlow.id,
           senderId: sender,
@@ -548,7 +504,7 @@ exports.handleWebhook = async (req, res) => {
           username
         );
       } else {
-        await logToPM2({
+        logToPM2({
           username,
           senderId: sender,
           receiverId: receiver,
@@ -559,12 +515,11 @@ exports.handleWebhook = async (req, res) => {
           userMessage: message,
           processingTime: (Date.now() - startTime) / 1000
         });
-        return res.json({ reply: "No matching flow found." });
+        return;
       }
     }
 
-    // ✅ Log successful webhook processing
-    await logToPM2({
+    logToPM2({
       username,
       senderId: sender,
       receiverId: receiver,
@@ -577,8 +532,7 @@ exports.handleWebhook = async (req, res) => {
     });
 
   } catch (error) {
-    // ✅ Log system errors
-    await logToPM2({
+    logToPM2({
       username: username || 'unknown',
       senderId: sender,
       receiverId: receiver,
@@ -599,10 +553,8 @@ exports.handleWebhook = async (req, res) => {
     } catch (logError) {
       logger.error("❌ Failed to insert error log into chatbot_logs table:", logError.message);
     }
-
-    return res.status(500).json({ error: "Internal server error." });
   }
-};
+}
 
 /** ========================================================================
  * ✅ FIND MATCHING FLOW UTILITY
@@ -715,7 +667,7 @@ async function findMatchingFlow(message, sender, receiver, username) {
     }
 
     if (defaultFlow && !hasActiveSession) {
-      await db.query(`DELETE FROM chatbot_default_cooldown_flow WHERE expiry_time < NOW()`);
+      // Cooldown cleanup runs via background interval in app.js
 
       const [cooldownRows] = await db.query(
         `SELECT * FROM chatbot_default_cooldown_flow 
@@ -777,140 +729,6 @@ async function findMatchingFlow(message, sender, receiver, username) {
   }
 }
 
-/** ========================================================================
- * ✅ CHECK AND TRACK FLOW UUID ON FIRST TRIGGER
- * ======================================================================== */
-
-/**
- * ✅ Check if flow contains UUID variable and create initial tracking entry
- * This function scans all nodes in the flow to detect if @uuid is used anywhere
- * and creates the initial UUID entry in chatbot_uuid table
- */
-async function checkAndTrackFlowUUID(
-  nodes,
-  flowId,
-  sender,
-  receiver,
-  sendername,
-  username,
-  triggerMessage
-) {
-  try {
-    logger.info(`🔍 Checking if flow ${flowId} contains UUID variable...`);
-
-    let hasUUID = false;
-    let uuidNodeDetails = null;
-
-    // Scan all nodes to check if any node contains @uuid variable
-    for (const node of nodes) {
-      if (!node.data) continue;
-
-      // Check different node types for @uuid usage
-      const fieldsToCheck = [
-        node.data.message,
-        node.data.bodyText,
-        node.data.label,
-        node.data.header,
-        node.data.footer,
-        node.data.caption,
-        JSON.stringify(node.data.attributes || []),
-        JSON.stringify(node.data.templateVariables || {}),
-        JSON.stringify(node.data.templateAttributes || [])
-      ];
-
-      for (const field of fieldsToCheck) {
-        if (field && typeof field === 'string' && field.includes('@uuid')) {
-          hasUUID = true;
-          uuidNodeDetails = {
-            nodeId: node.id,
-            nodeType: node.type,
-            nodeData: node.data
-          };
-          logger.info(`✅ Found @uuid in ${node.type} node (ID: ${node.id})`);
-          break;
-        }
-      }
-
-      if (hasUUID) break;
-    }
-
-    if (!hasUUID) {
-      logger.info(`ℹ️ No @uuid variable found in flow ${flowId}`);
-      return null;
-    }
-
-    // Generate 8-digit numeric UUID
-    const generatedUUID = Math.floor(10000000 + Math.random() * 90000000).toString();
-    logger.info(`🎯 Generated UUID for flow: ${generatedUUID}`);
-
-    // Store initial UUID tracking entry
-    await storeUUIDInteraction(generatedUUID, {
-      username,
-      flowId,
-      senderId: sender,
-      receiverId: receiver,
-      senderName: sendername,
-      interactionType: 'flow_triggered',
-      nodeId: uuidNodeDetails.nodeId,
-      nodeType: 'flow_start',
-      variableName: 'uuid',
-      variableValue: generatedUUID,
-      userSelection: null,
-      questionText: null,
-      buttonText: null,
-      listTitle: null,
-      additionalData: {
-        action: 'flow_triggered',
-        triggerMessage: triggerMessage,
-        timestamp: new Date().toISOString(),
-        uuidGeneratedAt: 'flow_start',
-        detectedInNode: uuidNodeDetails.nodeId,
-        detectedInNodeType: uuidNodeDetails.nodeType
-      }
-    });
-
-    await logToPM2({
-      username,
-      flowId,
-      nodeId: uuidNodeDetails.nodeId,
-      senderId: sender,
-      receiverId: receiver,
-      senderName: sendername,
-      logType: 'uuid_flow_initialized',
-      logLevel: 'info',
-      message: `UUID initialized for flow on first trigger: ${generatedUUID}`,
-      userMessage: triggerMessage,
-      variablesData: { uuid: generatedUUID },
-      metadata: {
-        uuid: generatedUUID,
-        detectedInNode: uuidNodeDetails.nodeId,
-        detectedInNodeType: uuidNodeDetails.nodeType,
-        flowContainsUUID: true
-      }
-    });
-
-    logger.info(`✅ UUID tracking initialized: ${generatedUUID} for flow ${flowId}`);
-    return generatedUUID;
-
-  } catch (error) {
-    logger.error(`❌ Error checking/tracking flow UUID: ${error.message}`);
-    logger.error(`Stack trace: ${error.stack}`);
-
-    await logToPM2({
-      username,
-      flowId,
-      senderId: sender,
-      receiverId: receiver,
-      senderName: sendername,
-      logType: 'uuid_flow_check_error',
-      logLevel: 'error',
-      message: `Failed to check/track flow UUID: ${error.message}`,
-      errorDetails: error.stack
-    });
-
-    return null;
-  }
-}
 
 /** ========================================================================
  * ✅ PROCESS CHATBOT FLOW
@@ -956,20 +774,6 @@ async function processChatbotFlow(
 
     let nodes = JSON.parse(stepsRows[0].nodes || "[]");
     let edges = JSON.parse(stepsRows[0].edges || "[]");
-
-    // ✅ CHECK IF FLOW CONTAINS UUID AND THIS IS FIRST TIME TRIGGER
-    // Only track UUID on first trigger (when lastNodeId is null or this is a new session)
-    if (!sessionDetails.lastNodeId) {
-      await checkAndTrackFlowUUID(
-        nodes,
-        sessionDetails.flowId,
-        sender,
-        receiver,
-        sendername,
-        username,
-        message
-      );
-    }
 
     nodes = nodes.map((node) => ({ ...node, id: node.id.toString() }));
     edges = edges.map((edge) => ({
@@ -3317,7 +3121,6 @@ async function handleSession(sender, receiver, source, flowId, messageType, trig
     });
 
     const sourceHandlesStr = sourceHandles ? JSON.stringify(sourceHandles) : "[]";
-    await db.query(`DELETE FROM chatbot_session WHERE expiry_time < NOW()`);
 
     const [existingSessions] = await db.query(
       `SELECT id, source, message_type, trigger_key, sourceHandle 
@@ -3416,21 +3219,6 @@ async function storeUserResponse(sender, receiver, flowId, variableName, variabl
       [sender, receiver, flowId, variableName, storedValue]
     );
 
-    // Track this interaction for any active UUIDs
-    await trackAllActiveUUIDs(sender, receiver, flowId, {
-      username,
-      interactionType,
-      nodeId: nodeData.nodeId,
-      nodeType: nodeData.nodeType || 'question',
-      variableName,
-      variableValue: storedValue,
-      userSelection: storedValue,
-      questionText: nodeData.questionText,
-      buttonText: buttonText,
-      listTitle: listText,
-      senderName: nodeData.senderName
-    });
-
     logger.info(`✅ User response successfully saved: ${storedValue} (type: ${interactionType})`);
   } catch (error) {
     logger.error(`❌ Failed to store user response: ${error.message}`);
@@ -3438,51 +3226,6 @@ async function storeUserResponse(sender, receiver, flowId, variableName, variabl
   }
 }
 
-/**
- * ✅ Track interaction for the active UUID for this user session
- */
-async function trackAllActiveUUIDs(sender, receiver, flowId, interactionData) {
-  try {
-    // Get the FIRST (oldest) UUID for this user in the current flow
-    // This ensures all interactions in a session are tracked under the same UUID
-    const [uuidRows] = await db.query(
-      `SELECT uuid FROM chatbot_uuid
-       WHERE sender_id = ? AND receiver_id = ? AND flow_id = ?
-       AND created_at >= DATE_SUB(NOW(), INTERVAL 24 HOUR)
-       ORDER BY created_at ASC
-       LIMIT 1`,
-      [sender, receiver, flowId]
-    );
-
-    if (uuidRows.length > 0) {
-      const sessionUUID = uuidRows[0].uuid;
-
-      // Track interaction ONLY for the original session UUID
-      await storeUUIDInteraction(sessionUUID, {
-        username: interactionData.username,
-        flowId,
-        senderId: sender,
-        receiverId: receiver,
-        senderName: interactionData.senderName,
-        interactionType: interactionData.interactionType,
-        nodeId: interactionData.nodeId,
-        nodeType: interactionData.nodeType,
-        variableName: interactionData.variableName,
-        variableValue: interactionData.variableValue,
-        userSelection: interactionData.userSelection,
-        questionText: interactionData.questionText,
-        buttonText: interactionData.buttonText,
-        listTitle: interactionData.listTitle
-      });
-
-      logger.info(`✅ Interaction tracked for UUID: ${sessionUUID} (type: ${interactionData.interactionType})`);
-    } else {
-      logger.info(`ℹ️ No active UUID found for this session - skipping UUID tracking`);
-    }
-  } catch (error) {
-    logger.error(`❌ Failed to track active UUIDs: ${error.message}`);
-  }
-}
 
 async function sendTextMessage(receiver, message, apiUrl, accessToken, sender, flowId, sendername) {
   const startTime = Date.now();
@@ -3573,94 +3316,14 @@ async function replaceVariables(text, sender, receiver, flowId, extra = {}, send
     name: sendername || extra.name || userVariables.name
   };
 
-  // Check if @uuid exists in text - fetch existing or generate new
-  let generatedUUID = null;
-  let hasUUIDVariable = text.includes('@uuid');
-
-  // If @uuid is in the text, fetch existing UUID first
-  if (hasUUIDVariable) {
-    try {
-      const [existingUUIDs] = await db.query(
-        `SELECT uuid FROM chatbot_uuid
-         WHERE sender_id = ? AND receiver_id = ? AND flow_id = ?
-         AND created_at >= DATE_SUB(NOW(), INTERVAL 24 HOUR)
-         ORDER BY created_at ASC
-         LIMIT 1`,
-        [sender, receiver, flowId]
-      );
-
-      if (existingUUIDs.length > 0) {
-        generatedUUID = existingUUIDs[0].uuid;
-        logger.info(`♻️ Reusing existing UUID: ${generatedUUID} for sender ${sender}`);
-      }
-    } catch (error) {
-      logger.error(`❌ Failed to fetch existing UUID: ${error.message}`);
-    }
-  }
-
   const result = text.replace(/@\w+/g, (match) => {
     const key = match.replace("@", "");
-
-    // Special handling for @uuid - use existing or generate new
-    if (key === "uuid") {
-      // If we already fetched an existing UUID, use it
-      if (generatedUUID) {
-        return generatedUUID;
-      }
-
-      // Generate new 8-digit numeric UUID (10000000 to 99999999)
-      generatedUUID = Math.floor(10000000 + Math.random() * 90000000).toString();
-      logger.info(`🆕 Generated NEW UUID: ${generatedUUID} for sender ${sender}`);
-
-      // Store the UUID mapping for this user session
-      storeUUIDForSession(generatedUUID, {
-        username,
-        flowId,
-        senderId: sender,
-        receiverId: receiver,
-        senderName: sendername
-      }).catch(err => {
-        logger.error(`Failed to store UUID session: ${err.message}`);
-      });
-
-      return generatedUUID;
-    }
-
     return variables[key] || match;
   });
 
   return result;
 }
 
-/**
- * ✅ Store UUID for session tracking
- */
-async function storeUUIDForSession(uuid, sessionData) {
-  try {
-    const { username, flowId, senderId, receiverId, senderName } = sessionData;
-
-    // Store initial UUID tracking entry
-    await storeUUIDInteraction(uuid, {
-      username,
-      flowId,
-      senderId,
-      receiverId,
-      senderName,
-      interactionType: 'text',
-      nodeType: 'uuid_generation',
-      variableName: 'uuid',
-      variableValue: uuid,
-      additionalData: {
-        action: 'uuid_generated',
-        timestamp: new Date().toISOString()
-      }
-    });
-
-    logger.info(`✅ UUID session stored: ${uuid}`);
-  } catch (error) {
-    logger.error(`❌ Failed to store UUID session: ${error.message}`);
-  }
-}
 
 async function fetchUserVariables(sender, receiver, flowId) {
   try {
@@ -4318,295 +3981,3 @@ async function insertLog(flowId, username, sender, receiver, errorType, errorMes
   }
 }
 
-/** ========================================================================
- * ✅ UUID TRACKING SYSTEM
- * ======================================================================== */
-
-/**
- * ✅ Store user interaction with UUID
- * This function stores all user interactions linked to a UUID
- */
-async function storeUUIDInteraction(uuid, interactionData) {
-  try {
-    const {
-      username,
-      flowId,
-      senderId,
-      receiverId,
-      senderName,
-      interactionType,
-      nodeId,
-      nodeType,
-      variableName,
-      variableValue,
-      userSelection,
-      questionText,
-      buttonText,
-      listTitle,
-      locationLatitude,
-      locationLongitude,
-      locationAddress,
-      mediaUrl,
-      mediaType,
-      additionalData
-    } = interactionData;
-
-    const query = `
-      INSERT INTO chatbot_uuid (
-        uuid, username, flow_id, sender_id, receiver_id, sender_name,
-        interaction_type, node_id, node_type, variable_name, variable_value,
-        user_selection, question_text, button_text, list_title,
-        location_latitude, location_longitude, location_address,
-        media_url, media_type, interaction_data, created_at, updated_at
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NOW(), NOW())
-    `;
-
-    const values = [
-      uuid,
-      username,
-      flowId,
-      senderId,
-      receiverId,
-      senderName || null,
-      interactionType,
-      nodeId || null,
-      nodeType || null,
-      variableName || null,
-      variableValue || null,
-      userSelection || null,
-      questionText || null,
-      buttonText || null,
-      listTitle || null,
-      locationLatitude || null,
-      locationLongitude || null,
-      locationAddress || null,
-      mediaUrl || null,
-      mediaType || null,
-      additionalData ? JSON.stringify(additionalData) : null
-    ];
-
-    await db.query(query, values);
-    logger.info(`✅ UUID interaction stored: ${uuid} - ${interactionType}`);
-
-    await logToPM2({
-      username,
-      flowId,
-      nodeId,
-      senderId,
-      receiverId,
-      senderName,
-      logType: 'uuid_interaction_stored',
-      logLevel: 'info',
-      message: `UUID interaction stored: ${interactionType}`,
-      metadata: {
-        uuid,
-        interactionType,
-        variableName,
-        variableValue
-      }
-    });
-
-  } catch (error) {
-    logger.error(`❌ Failed to store UUID interaction: ${error.message}`);
-    logger.error(`Stack trace: ${error.stack}`);
-  }
-}
-
-/**
- * ✅ Get UUID summary
- * Retrieves all interactions for a given UUID and formats them as a summary
- */
-async function getUUIDSummary(uuid) {
-  try {
-    const [interactions] = await db.query(
-      `SELECT * FROM chatbot_uuid
-       WHERE uuid = ?
-       ORDER BY created_at ASC`,
-      [uuid]
-    );
-
-    if (interactions.length === 0) {
-      return null;
-    }
-
-    // Build summary text
-    let summary = `📋 *Summary for UUID: ${uuid}*\n\n`;
-    summary += `👤 *User:* ${interactions[0].sender_name || 'Unknown'}\n`;
-    summary += `📱 *Phone:* ${interactions[0].sender_id}\n`;
-    summary += `📅 *Session Started:* ${new Date(interactions[0].created_at).toLocaleString()}\n`;
-    summary += `\n━━━━━━━━━━━━━━━━━━━━\n\n`;
-
-    // Group interactions by type
-    const questionResponses = [];
-    const buttonSelections = [];
-    const listSelections = [];
-    const locationShares = [];
-    const textMessages = [];
-    const mediaShares = [];
-
-    for (const interaction of interactions) {
-      switch (interaction.interaction_type) {
-        case 'question':
-          if (interaction.variable_name && interaction.variable_value) {
-            questionResponses.push({
-              question: interaction.question_text || interaction.variable_name,
-              answer: interaction.variable_value,
-              time: new Date(interaction.created_at).toLocaleString()
-            });
-          }
-          break;
-
-        case 'button':
-          if (interaction.button_text || interaction.user_selection) {
-            buttonSelections.push({
-              selected: interaction.button_text || interaction.user_selection,
-              time: new Date(interaction.created_at).toLocaleString()
-            });
-          }
-          break;
-
-        case 'list':
-          if (interaction.list_title || interaction.user_selection) {
-            listSelections.push({
-              selected: interaction.list_title || interaction.user_selection,
-              time: new Date(interaction.created_at).toLocaleString()
-            });
-          }
-          break;
-
-        case 'location':
-          if (interaction.location_latitude && interaction.location_longitude) {
-            locationShares.push({
-              latitude: interaction.location_latitude,
-              longitude: interaction.location_longitude,
-              address: interaction.location_address,
-              time: new Date(interaction.created_at).toLocaleString()
-            });
-          }
-          break;
-
-        case 'text':
-          if (interaction.variable_value) {
-            textMessages.push({
-              message: interaction.variable_value,
-              time: new Date(interaction.created_at).toLocaleString()
-            });
-          }
-          break;
-
-        case 'media':
-          if (interaction.media_url) {
-            mediaShares.push({
-              type: interaction.media_type,
-              url: interaction.media_url,
-              time: new Date(interaction.created_at).toLocaleString()
-            });
-          }
-          break;
-      }
-    }
-
-    // Add question responses to summary
-    if (questionResponses.length > 0) {
-      summary += `❓ *Question Responses:*\n`;
-      questionResponses.forEach((q, index) => {
-        summary += `\n${index + 1}. *${q.question}*\n`;
-        summary += `   Answer: ${q.answer}\n`;
-        summary += `   ⏰ ${q.time}\n`;
-      });
-      summary += `\n━━━━━━━━━━━━━━━━━━━━\n\n`;
-    }
-
-    // Add button selections to summary
-    if (buttonSelections.length > 0) {
-      summary += `🔘 *Button Selections:*\n`;
-      buttonSelections.forEach((b, index) => {
-        summary += `${index + 1}. ${b.selected}\n`;
-        summary += `   ⏰ ${b.time}\n`;
-      });
-      summary += `\n━━━━━━━━━━━━━━━━━━━━\n\n`;
-    }
-
-    // Add list selections to summary
-    if (listSelections.length > 0) {
-      summary += `📝 *List Selections:*\n`;
-      listSelections.forEach((l, index) => {
-        summary += `${index + 1}. ${l.selected}\n`;
-        summary += `   ⏰ ${l.time}\n`;
-      });
-      summary += `\n━━━━━━━━━━━━━━━━━━━━\n\n`;
-    }
-
-    // Add location shares to summary
-    if (locationShares.length > 0) {
-      summary += `📍 *Location Shares:*\n`;
-      locationShares.forEach((loc, index) => {
-        summary += `${index + 1}. Coordinates: ${loc.latitude}, ${loc.longitude}\n`;
-        if (loc.address) {
-          summary += `   Address: ${loc.address}\n`;
-        }
-        summary += `   ⏰ ${loc.time}\n`;
-      });
-      summary += `\n━━━━━━━━━━━━━━━━━━━━\n\n`;
-    }
-
-    // Add text messages to summary
-    if (textMessages.length > 0) {
-      summary += `💬 *Text Messages:*\n`;
-      textMessages.forEach((t, index) => {
-        summary += `${index + 1}. ${t.message}\n`;
-        summary += `   ⏰ ${t.time}\n`;
-      });
-      summary += `\n━━━━━━━━━━━━━━━━━━━━\n\n`;
-    }
-
-    // Add media shares to summary
-    if (mediaShares.length > 0) {
-      summary += `📎 *Media Shares:*\n`;
-      mediaShares.forEach((m, index) => {
-        summary += `${index + 1}. Type: ${m.type || 'Unknown'}\n`;
-        summary += `   URL: ${m.url}\n`;
-        summary += `   ⏰ ${m.time}\n`;
-      });
-      summary += `\n━━━━━━━━━━━━━━━━━━━━\n\n`;
-    }
-
-    summary += `\n📊 *Total Interactions:* ${interactions.length}\n`;
-    summary += `⏱️ *Last Updated:* ${new Date(interactions[interactions.length - 1].updated_at).toLocaleString()}`;
-
-    return {
-      summary,
-      interactions,
-      stats: {
-        totalInteractions: interactions.length,
-        questionResponses: questionResponses.length,
-        buttonSelections: buttonSelections.length,
-        listSelections: listSelections.length,
-        locationShares: locationShares.length,
-        textMessages: textMessages.length,
-        mediaShares: mediaShares.length
-      }
-    };
-
-  } catch (error) {
-    logger.error(`❌ Failed to get UUID summary: ${error.message}`);
-    logger.error(`Stack trace: ${error.stack}`);
-    return null;
-  }
-}
-
-/**
- * ✅ Track interaction with UUID
- * Helper function to automatically track user interactions
- */
-async function trackInteractionWithUUID(currentUUID, interactionData) {
-  if (!currentUUID) {
-    return;
-  }
-
-  try {
-    await storeUUIDInteraction(currentUUID, interactionData);
-  } catch (error) {
-    logger.error(`❌ Failed to track interaction with UUID: ${error.message}`);
-  }
-}
