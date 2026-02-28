@@ -970,10 +970,20 @@ case "assignUser":
 
 
 
+      case "timeDelay": {
+        const delayData = JSON.parse(currentNode.data.delay || '{"minutes":0,"seconds":0}');
+        const delayMs = ((delayData.minutes || 0) * 60 + (delayData.seconds || 0)) * 1000;
+        if (delayMs > 0) {
+          logger.info(`⏳ timeDelay: waiting ${delayMs}ms for node ${currentNode.id}`);
+          await new Promise(resolve => setTimeout(resolve, delayMs));
+        }
+        break;
+      }
+
       // ✅ NEW: Handle AI Node
-     case "ai":
-  await processAINodeSimple(currentNode, receiver, apiUrl, accessToken, flowId, sender, edges, sendername, username);
-  return; 
+      case "ai":
+        await processAINodeSimple(currentNode, receiver, apiUrl, accessToken, flowId, sender, edges, sendername, username);
+        return;
 
       default:
         const errorMsg = `Unsupported Node Type: "${currentNode.type}"`;
