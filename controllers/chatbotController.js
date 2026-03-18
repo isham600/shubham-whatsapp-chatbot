@@ -3163,7 +3163,8 @@ async function handleSession(sender, receiver, source, flowId, messageType, trig
       [sender, receiver, flowId, source, messageType, triggerKey, sourceHandlesStr, expiryTime]
     );
   } catch (error) {
-    logger.error("❌ Failed to handle session:", error.message);
+    logger.error(`❌ Failed to handle session: [${error.code || 'ERR'}] ${error.sqlMessage || error.message}`);
+    logger.error("Stack:", error.stack);
     throw error;
   }
 }
