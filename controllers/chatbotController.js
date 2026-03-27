@@ -1643,7 +1643,12 @@ async function processButtonsNode(node, receiver, apiUrl, accessToken, sender, f
     saveChatMessage({
       username, senderId: sender, receiverId: receiver, senderName: sendername,
       type: 'button',
-      text: JSON.stringify(finalButtons.map(b => ({ id: b.reply.id, text: b.reply.title }))),
+      text: JSON.stringify({
+        header: finalHeader || null,
+        body: finalBody,
+        footer: finalFooter || null,
+        buttons: finalButtons.map(b => ({ id: b.reply.id, text: b.reply.title }))
+      }),
       whtsRefId: response?.messages?.[0]?.id
     });
 
@@ -1754,10 +1759,13 @@ async function processListNode(currentNode, receiver, apiUrl, accessToken, sende
     saveChatMessage({
       username, senderId: sender, receiverId: receiver, senderName: sendername,
       type: 'list',
-      text: JSON.stringify(parsedSections.map(sec => ({
-        title: sec.title,
-        rows: sec.rows.map(r => ({ id: r.id, text: r.title }))
-      }))),
+      text: JSON.stringify({
+        body: finalBodyText,
+        sections: parsedSections.map(sec => ({
+          title: sec.title,
+          rows: sec.rows.map(r => ({ id: r.id, text: r.title }))
+        }))
+      }),
       whtsRefId: response?.data?.messages?.[0]?.id
     });
 
