@@ -100,6 +100,30 @@ function logToPM2({
   });
 }
 
+/**
+ * ✅ Save bot-sent message to chat_messages table (fire-and-forget)
+ */
+function saveChatMessage({ username, senderId, receiverId, senderName, type, text, media, whtsRefId, templateId, attributes, templateMedia }) {
+  const attrValue = attributes
+    ? (Array.isArray(attributes) ? '[]' : JSON.stringify(attributes))
+    : '[]';
+
+  const query = `
+    INSERT INTO chat_messages
+    (username, sender_id, receiver_id, status, eventDescription, replySourceMessage,
+     text, media, type, eventtype, whts_ref_id, template_id, attributes, template_media,
+     created_at, updated_at)
+    VALUES (?, ?, ?, 1, 'Bot Replied', ?, ?, ?, ?, 'broadcastMessage', ?, ?, ?, ?, NOW(), NOW())
+  `;
+
+  db.query(query, [
+    username, senderId, receiverId, senderName,
+    text || null, media || null, type,
+    whtsRefId || null, templateId || null,
+    attrValue, templateMedia || null
+  ]).catch(err => logger.error("❌ Failed to save chat_message:", err.message));
+}
+
 /** ========================================================================
  * ✅ MAIN WEBHOOK HANDLER
  * ======================================================================== */
@@ -1496,7 +1520,7 @@ async function processSendMessageNode(currentNode, receiver, apiUrl, accessToken
             apiEndpoint: apiUrl
           });
 
-          await sendMediaMessage(
+          const mediaRes = await sendMediaMessage(
             receiver,
             currentNode.data.caption || "",
             mediaType,
@@ -1505,6 +1529,13 @@ async function processSendMessageNode(currentNode, receiver, apiUrl, accessToken
             accessToken,
             fileName
           );
+          saveChatMessage({
+            username, senderId: sender, receiverId: receiver, senderName: sendername,
+            type: mediaType,
+            text: currentNode.data.caption || null,
+            media: media.media,
+            whtsRefId: mediaRes?.messages?.[0]?.id
+          });
         }
       }
     }
@@ -1532,7 +1563,13 @@ async function processSendMessageNode(currentNode, receiver, apiUrl, accessToken
         processingTime: (Date.now() - startTime) / 1000
       });
 
-      await sendTextMessage(receiver, finalMessage, apiUrl, accessToken, sender, flowId, sendername);
+      const textRes = await sendTextMessage(receiver, finalMessage, apiUrl, accessToken, sender, flowId, sendername);
+      saveChatMessage({
+        username, senderId: sender, receiverId: receiver, senderName: sendername,
+        type: 'text',
+        text: finalMessage,
+        whtsRefId: textRes?.messages?.[0]?.id
+      });
     }
   } catch (error) {
     await logToPM2({
@@ -1603,7 +1640,13 @@ async function processButtonsNode(node, receiver, apiUrl, accessToken, sender, f
     });
 
     const response = await sendInteractiveMessage(apiUrl, buttonPayload, accessToken);
-    
+    saveChatMessage({
+      username, senderId: sender, receiverId: receiver, senderName: sendername,
+      type: 'button',
+      text: JSON.stringify(finalButtons.map(b => ({ id: b.reply.id, text: b.reply.title }))),
+      whtsRefId: response?.messages?.[0]?.id
+    });
+
     await logToPM2({
       username,
       flowId,
@@ -1617,7 +1660,7 @@ async function processButtonsNode(node, receiver, apiUrl, accessToken, sender, f
       responsePayload: response,
       processingTime: (Date.now() - startTime) / 1000
     });
-    
+
   } catch (error) {
     await logToPM2({
       username,
@@ -1708,6 +1751,15 @@ async function processListNode(currentNode, receiver, apiUrl, accessToken, sende
 
     const headers = getHeaders(apiUrl, accessToken);
     const response = await axios.post(apiUrl, listPayload, { headers });
+    saveChatMessage({
+      username, senderId: sender, receiverId: receiver, senderName: sendername,
+      type: 'list',
+      text: JSON.stringify(parsedSections.map(sec => ({
+        title: sec.title,
+        rows: sec.rows.map(r => ({ id: r.id, text: r.title }))
+      }))),
+      whtsRefId: response?.data?.messages?.[0]?.id
+    });
 
     await logToPM2({
       username,
@@ -1767,7 +1819,13 @@ async function processQuestionNode(currentNode, receiver, apiUrl, accessToken, s
         metadata: { questionType: 'text', variableName }
       });
 
-      await sendTextMessage(receiver, finalMessage, apiUrl, accessToken, sender, flowId, sendername);
+      const qTextRes = await sendTextMessage(receiver, finalMessage, apiUrl, accessToken, sender, flowId, sendername);
+      saveChatMessage({
+        username, senderId: sender, receiverId: receiver, senderName: sendername,
+        type: 'text',
+        text: finalMessage,
+        whtsRefId: qTextRes?.messages?.[0]?.id
+      });
     } else {
       const payload = await buildButtonPayload(
         receiver,
@@ -1780,7 +1838,7 @@ async function processQuestionNode(currentNode, receiver, apiUrl, accessToken, s
         flowId,
         sendername
       );
-      
+
       await logToPM2({
         username,
         flowId,
@@ -1796,7 +1854,14 @@ async function processQuestionNode(currentNode, receiver, apiUrl, accessToken, s
         metadata: { questionType: 'button', variableName }
       });
 
-      await sendInteractiveMessage(apiUrl, payload, accessToken);
+      const qBtnRes = await sendInteractiveMessage(apiUrl, payload, accessToken);
+      const answerOptions = JSON.parse(currentNode.data.answerOptions || '[]');
+      saveChatMessage({
+        username, senderId: sender, receiverId: receiver, senderName: sendername,
+        type: 'button',
+        text: JSON.stringify(answerOptions.map(b => ({ id: b.id, text: b.text }))),
+        whtsRefId: qBtnRes?.messages?.[0]?.id
+      });
       questionType = "button";
     }
 
@@ -1972,6 +2037,27 @@ async function processTemplateNode(currentNode, receiver, apiUrl, accessToken, f
 
     const sendRes = await sendInteractiveMessage(apiUrl, payload, accessToken);
     logger.info("✅ Template message sent successfully");
+
+    // Build attributes object: {attribute1: val, attribute2: val, ...} or [] if none
+    const resolvedAttrValues = await Promise.all(
+      rawAttributes.map(attr => attr && attr.trim()
+        ? replaceVariables(attr, sender, receiver, flowId, {}, sendername)
+        : Promise.resolve('')
+      )
+    );
+    const attributesForChat = rawAttributes.length > 0
+      ? Object.fromEntries(resolvedAttrValues.map((v, i) => [`attribute${i + 1}`, v]))
+      : [];
+
+    saveChatMessage({
+      username, senderId: sender, receiverId: receiver, senderName: sendername,
+      type: 'template',
+      text: template.template_name,
+      whtsRefId: sendRes?.messages?.[0]?.id,
+      templateId: template.id,
+      attributes: attributesForChat,
+      templateMedia: mediaPreview || null
+    });
 
     return sendRes;
   } catch (error) {
@@ -3415,8 +3501,14 @@ async function processCtaUrlNode(currentNode, receiver, apiUrl, accessToken, flo
       metadata: { ctaUrl: url, buttonText }
     });
     
-    await sendInteractiveMessage(apiUrl, ctaPayload, accessToken);
-    
+    const ctaRes = await sendInteractiveMessage(apiUrl, ctaPayload, accessToken);
+    saveChatMessage({
+      username, senderId: sender, receiverId: receiver, senderName: sendername,
+      type: 'button',
+      text: JSON.stringify([{ text: buttonText, url }]),
+      whtsRefId: ctaRes?.messages?.[0]?.id
+    });
+
     const nextEdge = edges.find((edge) => edge.source === currentNode.id);
     if (nextEdge) {
       await processChatbotFlow(
@@ -3572,6 +3664,12 @@ async function processLocationRequestNode(currentNode, receiver, apiUrl, accessT
 
     const headers = getHeaders(apiUrl, accessToken);
     const response = await axios.post(apiUrl, requestLocationPayload, { headers });
+    saveChatMessage({
+      username, senderId: sender, receiverId: receiver, senderName: sendername,
+      type: 'location',
+      text: finalBodyText,
+      whtsRefId: response?.data?.messages?.[0]?.id
+    });
 
     await logToPM2({
       username,
