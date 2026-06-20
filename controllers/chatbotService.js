@@ -22,10 +22,10 @@ class ChatbotService {
       const [rows] = await db.query(
         `SELECT ai, ai_memory
          FROM chatbot_session
-         WHERE sender_id = ? AND ai = 1
+         WHERE sender_id = ? AND receiver_id = ? AND ai = 1
          ORDER BY updated_at DESC
          LIMIT 1`,
-        [sender]
+        [sender, receiver]
       );
 
       if (!rows.length || Number(rows[0].ai) !== 1 || !rows[0].ai_memory) {
@@ -67,8 +67,8 @@ class ChatbotService {
       await db.query(
         `UPDATE chatbot_session
          SET source = ?, message_type = 'ai', ai = 1, ai_memory = ?, expiry_time = ?, updated_at = NOW()
-         WHERE sender_id = ?`,
-        [aiNodeId, JSON.stringify(nextMemory), expiryTime, sender]
+         WHERE sender_id = ? AND receiver_id = ?`,
+        [aiNodeId, JSON.stringify(nextMemory), expiryTime, sender, receiver]
       );
     } catch (error) {
       if (this.isUnknownColumnError(error)) {
