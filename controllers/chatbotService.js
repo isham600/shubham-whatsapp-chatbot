@@ -22,17 +22,18 @@ class ChatbotService {
       const [rows] = await db.query(
         `SELECT ai, ai_memory
          FROM chatbot_session
-         WHERE sender_id = ? AND receiver_id = ?
+         WHERE sender_id = ? AND ai = 1
          ORDER BY updated_at DESC
          LIMIT 1`,
-        [sender, receiver]
+        [sender]
       );
 
       if (!rows.length || Number(rows[0].ai) !== 1 || !rows[0].ai_memory) {
         return [];
       }
 
-      const parsed = JSON.parse(rows[0].ai_memory);
+      const rawMemory = rows[0].ai_memory;
+      const parsed = typeof rawMemory === "string" ? JSON.parse(rawMemory) : rawMemory;
       return Array.isArray(parsed) ? parsed : [];
     } catch (error) {
       if (!this.isUnknownColumnError(error)) {
@@ -66,8 +67,8 @@ class ChatbotService {
       await db.query(
         `UPDATE chatbot_session
          SET source = ?, message_type = 'ai', ai = 1, ai_memory = ?, expiry_time = ?, updated_at = NOW()
-         WHERE sender_id = ? AND receiver_id = ?`,
-        [aiNodeId, JSON.stringify(nextMemory), expiryTime, sender, receiver]
+         WHERE sender_id = ?`,
+        [aiNodeId, JSON.stringify(nextMemory), expiryTime, sender]
       );
     } catch (error) {
       if (this.isUnknownColumnError(error)) {
@@ -75,6 +76,30 @@ class ChatbotService {
         return;
       }
       logger.error(`❌ Failed to update AI session memory: ${error.message}`);
+      throw error;
+    }
+  }
+
+  async clearAISession(sender, receiver = null) {
+    const receiverClause = receiver ? " AND receiver_id = ?" : "";
+    const params = receiver ? [sender, receiver] : [sender];
+    try {
+      await db.query(
+        `UPDATE chatbot_session
+         SET ai = 0, ai_memory = NULL, source = NULL, message_type = '', updated_at = NOW()
+         WHERE sender_id = ?${receiverClause}`,
+        params
+      );
+    } catch (error) {
+      if (this.isUnknownColumnError(error)) {
+        await db.query(
+          `UPDATE chatbot_session
+           SET source = NULL, message_type = '', updated_at = NOW()
+           WHERE sender_id = ?${receiverClause}`,
+          params
+        );
+        return;
+      }
       throw error;
     }
   }
@@ -735,6 +760,8 @@ Instructions:
 - Keep the reply under 1000 characters (WhatsApp friendly).
 - Be friendly and professional; address the user by name when it feels natural.
 - Respond in the user's language.
+- Use the recent conversation context to interpret short follow-ups.
+- If the user answers a question you asked earlier, continue from that answer and do not repeat the same question unless required.
 - If something is outside your knowledge, say so politely and suggest contacting the office. Never invent details.
 
 Response:`;
@@ -772,8 +799,8 @@ Response:`;
       });
     }
 
-    // Send response but DON'T change session source - stay in AI node
-    await this.sendTextMessage(receiver, finalResponse, apiUrl, accessToken, sender, flowId, sendername);
+    // Send response with an end-session option for returning to the default chatbot flow.
+    await this.sendTextWithEndSessionButton(receiver, finalResponse, apiUrl, accessToken, sender, flowId, sendername);
 
     logger.info("📤 Chatbot response sent - user remains in AI node for continued conversation");
 
@@ -811,11 +838,11 @@ Response:`;
         formattedResponse = await this.formatApiResponse(apiResponse, apiConfig.responseFormat);
       }
 
-      await this.sendTextMessage(receiver, formattedResponse, apiUrl, accessToken, sender, flowId, sendername);
+      await this.sendTextWithEndSessionButton(receiver, formattedResponse, apiUrl, accessToken, sender, flowId, sendername);
       logger.info("✅ API response sent - user remains in AI node for continued conversation");
     } catch (error) {
       logger.error("❌ API action execution error:", error.message);
-      await this.sendTextMessage(receiver, "I'm sorry, I couldn't retrieve that information right now. Please try again in a moment.", apiUrl, accessToken, sender, flowId, sendername);
+      await this.sendTextWithEndSessionButton(receiver, "I'm sorry, I couldn't retrieve that information right now. Please try again in a moment.", apiUrl, accessToken, sender, flowId, sendername);
     }
   }
 
@@ -867,7 +894,48 @@ Response:`;
 
   async sendFallbackMessage(receiver, fallbackMessage, apiUrl, accessToken, sender, flowId, sendername, username) {
     logger.info("📤 Sending fallback message - no route matched user intent");
-    await this.sendTextMessage(receiver, fallbackMessage, apiUrl, accessToken, sender, flowId, sendername);
+    await this.sendTextWithEndSessionButton(receiver, fallbackMessage, apiUrl, accessToken, sender, flowId, sendername);
+  }
+
+  async sendTextWithEndSessionButton(receiver, message, apiUrl, accessToken, sender, flowId, sendername) {
+    if (!message || message.trim() === "") throw new Error("Cannot send empty message");
+    if (!apiUrl || !accessToken) throw new Error("API URL or Access Token is missing");
+
+    const payload = {
+      messaging_product: "whatsapp",
+      to: receiver,
+      type: "interactive",
+      interactive: {
+        type: "button",
+        body: { text: message },
+        action: {
+          buttons: [
+            {
+              type: "reply",
+              reply: {
+                id: "end_ai_session",
+                title: "End Session"
+              }
+            }
+          ]
+        }
+      }
+    };
+
+    try {
+      const headers = this.getHeaders(apiUrl, accessToken);
+      const response = await axios.post(apiUrl, payload, { headers, timeout: 10000 });
+
+      if (!(response.status === 200 && response.data?.messages?.length > 0)) {
+        throw new Error("Invalid API response");
+      }
+
+      logger.info(`📨 Interactive AI message sent successfully: "${message.substring(0, 50)}..."`);
+      return response.data;
+    } catch (error) {
+      logger.warn(`⚠️ Interactive AI send failed, falling back to text: ${error.message}`);
+      return this.sendTextMessage(receiver, message, apiUrl, accessToken, sender, flowId, sendername);
+    }
   }
 
   async sendTextMessage(receiver, message, apiUrl, accessToken, sender, flowId, sendername) {

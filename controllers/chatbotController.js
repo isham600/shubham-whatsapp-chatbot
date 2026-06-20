@@ -330,6 +330,22 @@ async function processWebhookInBackground(data, ipAddress, userAgent) {
 
     logger.info(`🧭 Active session count for ${sender} -> ${receiver}: ${allSessions.length}`);
 
+    const normalizedMessage = String(message || "").trim().toLowerCase();
+    if (["end_ai_session", "end session", "endsession"].includes(normalizedMessage)) {
+      await chatbotService.clearAISession(sender);
+      await sendTextMessage(
+        receiver,
+        "AI session ended. You can start again with the default chatbot.",
+        META_API_URL,
+        ACCESS_TOKEN,
+        sender,
+        null,
+        sendername
+      );
+      logger.info(`✅ AI session cleared for sender ${sender}`);
+      return;
+    }
+
     let processedSession = false;
 
     for (const session of allSessions) {
