@@ -328,9 +328,12 @@ async function processWebhookInBackground(data, ipAddress, userAgent) {
       allSessions = [latestSession];
     }
 
+    logger.info(`🧭 Active session count for ${sender} -> ${receiver}: ${allSessions.length}`);
+
     let processedSession = false;
 
     for (const session of allSessions) {
+      logger.info(`🧭 Evaluating session ${session.id}: type=${session.message_type}, source=${session.source}, trigger=${session.trigger_key}`);
       const sessionDetails = {
         flowId: session.flow_id,
         lastNodeId: session.source,
@@ -450,21 +453,7 @@ async function processWebhookInBackground(data, ipAddress, userAgent) {
 //       }
 
 // ✅ CASE 3: AI node response handling (continued conversation / looping)
-if (session.message_type === "ai") {
-  await logToPM2({
-    username,
-    flowId: session.flow_id,
-    nodeId: session.source,
-    senderId: sender,
-    receiverId: receiver,
-    senderName: sendername,
-    logType: 'ai_continued_conversation',
-    logLevel: 'info',
-    message: 'User continuing conversation in AI node',
-    userMessage: message,
-    sessionData: session
-  });
-
+if (Number(session.ai) === 1 || session.message_type === "ai" || session.source) {
   const [stepsRows] = await db.query(
     "SELECT nodes, edges FROM chatbot_steps WHERE flow_id = ?",
     [session.flow_id]
@@ -476,6 +465,23 @@ if (session.message_type === "ai") {
     const aiNode = nodes.find(node => node.id === session.source);
 
     if (aiNode && aiNode.type === "ai") {
+      await logToPM2({
+        username,
+        flowId: session.flow_id,
+        nodeId: session.source,
+        senderId: sender,
+        receiverId: receiver,
+        senderName: sendername,
+        logType: 'ai_continued_conversation',
+        logLevel: 'info',
+        message: 'User continuing conversation in AI node',
+        userMessage: message,
+        sessionData: session
+      });
+
+      if (Number(session.ai) !== 1 || session.message_type !== "ai") {
+        logger.warn(`⚠️ Session ${session.id} forcing AI resume. ai=${session.ai}, message_type=${session.message_type}`);
+      }
       // Live incoming message bhejo (DB se stale value nahi).
       // chatbotService.processAINode andar keepUserInAINode() call karta hai,
       // jo message_type = 'ai' maintain rakhta hai -> agla message bhi yahi loop me aayega.
@@ -496,9 +502,6 @@ if (session.message_type === "ai") {
       return;
     }
   }
-
-  await sendTextMessage(receiver, "I'm sorry, there was an issue processing your message. Please try again.", META_API_URL, ACCESS_TOKEN, sender, session.flow_id, sendername);
-  return;
 }
 
       // ✅ CASE 4: Resume a stored normal node on the next user message
@@ -3522,22 +3525,48 @@ async function handleSession(sender, receiver, source, flowId, messageType, trig
     if (existingSessions.length > 0) {
       const existingSession = existingSessions[0];
       const expiryTime = new Date(Date.now() + 1 * 60 * 60 * 1000);
-      await db.query(
-        `UPDATE chatbot_session 
-         SET flow_id = ?, source = ?, message_type = ?, trigger_key = ?, sourceHandle = ?, expiry_time = ?, updated_at = NOW() 
-         WHERE id = ?`,
-        [flowId, source, messageType, triggerKey, sourceHandlesStr, expiryTime, existingSession.id]
-      );
+      try {
+        await db.query(
+          `UPDATE chatbot_session 
+           SET flow_id = ?, source = ?, message_type = ?, trigger_key = ?, sourceHandle = ?, ai = 0, ai_memory = NULL, expiry_time = ?, updated_at = NOW() 
+           WHERE id = ?`,
+          [flowId, source, messageType, triggerKey, sourceHandlesStr, expiryTime, existingSession.id]
+        );
+      } catch (error) {
+        if (error?.code === "ER_BAD_FIELD_ERROR" || /Unknown column/i.test(error?.message || "")) {
+          await db.query(
+            `UPDATE chatbot_session 
+             SET flow_id = ?, source = ?, message_type = ?, trigger_key = ?, sourceHandle = ?, expiry_time = ?, updated_at = NOW() 
+             WHERE id = ?`,
+            [flowId, source, messageType, triggerKey, sourceHandlesStr, expiryTime, existingSession.id]
+          );
+        } else {
+          throw error;
+        }
+      }
       return;
     }
 
     const expiryTime = new Date(Date.now() + 1 * 60 * 60 * 1000);
-    await db.query(
-      `INSERT INTO chatbot_session 
-       (sender_id, receiver_id, flow_id, source, message_type, trigger_key, sourceHandle, expiry_time, created_at, updated_at) 
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, NOW(), NOW())`,
-      [sender, receiver, flowId, source, messageType, triggerKey, sourceHandlesStr, expiryTime]
-    );
+    try {
+      await db.query(
+        `INSERT INTO chatbot_session 
+         (sender_id, receiver_id, flow_id, source, message_type, trigger_key, sourceHandle, ai, ai_memory, expiry_time, created_at, updated_at) 
+         VALUES (?, ?, ?, ?, ?, ?, ?, 0, NULL, ?, NOW(), NOW())`,
+        [sender, receiver, flowId, source, messageType, triggerKey, sourceHandlesStr, expiryTime]
+      );
+    } catch (error) {
+      if (error?.code === "ER_BAD_FIELD_ERROR" || /Unknown column/i.test(error?.message || "")) {
+        await db.query(
+          `INSERT INTO chatbot_session 
+           (sender_id, receiver_id, flow_id, source, message_type, trigger_key, sourceHandle, expiry_time, created_at, updated_at) 
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, NOW(), NOW())`,
+          [sender, receiver, flowId, source, messageType, triggerKey, sourceHandlesStr, expiryTime]
+        );
+      } else {
+        throw error;
+      }
+    }
   } catch (error) {
     logger.error(`❌ Failed to handle session: [${error.code || 'ERR'}] ${error.sqlMessage || error.message}`);
     logger.error("Stack:", error.stack);
@@ -3548,12 +3577,25 @@ async function handleSession(sender, receiver, source, flowId, messageType, trig
 async function updateSessionForPause(sender, receiver, flowId, nodeId, messageType, questionType, variableName) {
   try {
     const expiryTime = new Date(Date.now() + 1 * 60 * 60 * 1000);
-    await db.query(
-      `UPDATE chatbot_session
-       SET source = ?, message_type = ?, question_type = ?, variable_name = ?, expiry_time = ?, updated_at = NOW()
-       WHERE sender_id = ? AND receiver_id = ?`,
-      [nodeId, messageType, questionType, variableName, expiryTime, sender, receiver]
-    );
+    try {
+      await db.query(
+        `UPDATE chatbot_session
+         SET source = ?, message_type = ?, question_type = ?, variable_name = ?, ai = 0, ai_memory = NULL, expiry_time = ?, updated_at = NOW()
+         WHERE sender_id = ? AND receiver_id = ?`,
+        [nodeId, messageType, questionType, variableName, expiryTime, sender, receiver]
+      );
+    } catch (error) {
+      if (error?.code === "ER_BAD_FIELD_ERROR" || /Unknown column/i.test(error?.message || "")) {
+        await db.query(
+          `UPDATE chatbot_session
+           SET source = ?, message_type = ?, question_type = ?, variable_name = ?, expiry_time = ?, updated_at = NOW()
+           WHERE sender_id = ? AND receiver_id = ?`,
+          [nodeId, messageType, questionType, variableName, expiryTime, sender, receiver]
+        );
+      } else {
+        throw error;
+      }
+    }
 
     logger.info(`✅ Session updated for pause. Sender: ${sender}, Flow ID: ${flowId}, Node ID: ${nodeId}`);
   } catch (error) {
@@ -4001,7 +4043,7 @@ async function processNextNode(nextNode, sender, receiver, flowId, message, apiU
   const startTime = Date.now();
   
   try {
-    const [stepsRows] = await db.query("SELECT nodes FROM chatbot_steps WHERE flow_id = ?", [flowId]);
+    const [stepsRows] = await db.query("SELECT nodes, edges FROM chatbot_steps WHERE flow_id = ?", [flowId]);
 
     if (!stepsRows.length) {
       throw new Error(`❌ No steps found for Flow ID: ${flowId}`);
@@ -4029,6 +4071,30 @@ async function processNextNode(nextNode, sender, receiver, flowId, message, apiU
       processingTime: (Date.now() - startTime) / 1000,
       metadata: { nextNodeType: nextNodeDetails.type }
     });
+
+    if (nextNodeDetails.type === "ai") {
+      const expiryTime = new Date(Date.now() + 1 * 60 * 60 * 1000);
+      try {
+        await db.query(
+          `UPDATE chatbot_session
+           SET source = ?, message_type = 'ai', ai = 1, expiry_time = ?, updated_at = NOW()
+           WHERE sender_id = ? AND receiver_id = ?`,
+          [nextNode, expiryTime, sender, receiver]
+        );
+      } catch (error) {
+        if (error?.code === "ER_BAD_FIELD_ERROR" || /Unknown column/i.test(error?.message || "")) {
+          await db.query(
+            `UPDATE chatbot_session
+             SET source = ?, message_type = 'ai', expiry_time = ?, updated_at = NOW()
+             WHERE sender_id = ? AND receiver_id = ?`,
+            [nextNode, expiryTime, sender, receiver]
+          );
+        } else {
+          throw error;
+        }
+      }
+      logger.info(`✅ Session pre-marked for AI resume. Sender: ${sender}, Node ID: ${nextNode}`);
+    }
 
     await processNode(
       nextNodeDetails,

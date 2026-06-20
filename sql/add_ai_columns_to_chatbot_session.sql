@@ -1,0 +1,3 @@
+ALTER TABLE chatbot_session
+ADD COLUMN ai TINYINT(1) NOT NULL DEFAULT 0 AFTER sourceHandle,
+ADD COLUMN ai_memory JSON NULL AFTER ai;

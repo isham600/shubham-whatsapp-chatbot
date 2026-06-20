@@ -13,6 +13,72 @@ class ChatbotService {
     logger.info(`🔑 API Keys Status: Gemini: ${this.geminiApiKey ? 'SET' : 'NOT SET'}, OpenAI: ${this.openaiApiKey ? 'SET' : 'NOT SET'}`);
   }
 
+  isUnknownColumnError(error) {
+    return error?.code === "ER_BAD_FIELD_ERROR" || /Unknown column/i.test(error?.message || "");
+  }
+
+  async getSessionAIMemory(sender, receiver) {
+    try {
+      const [rows] = await db.query(
+        `SELECT ai, ai_memory
+         FROM chatbot_session
+         WHERE sender_id = ? AND receiver_id = ?
+         ORDER BY updated_at DESC
+         LIMIT 1`,
+        [sender, receiver]
+      );
+
+      if (!rows.length || Number(rows[0].ai) !== 1 || !rows[0].ai_memory) {
+        return [];
+      }
+
+      const parsed = JSON.parse(rows[0].ai_memory);
+      return Array.isArray(parsed) ? parsed : [];
+    } catch (error) {
+      if (!this.isUnknownColumnError(error)) {
+        logger.error(`❌ Failed to read AI session memory: ${error.message}`);
+      }
+      return [];
+    }
+  }
+
+  buildMemoryContext(aiMemory) {
+    if (!Array.isArray(aiMemory) || aiMemory.length === 0) return "";
+
+    const memoryLines = aiMemory
+      .slice(-8)
+      .map((item) => `${item.role === "assistant" ? "Assistant" : "User"}: ${item.content}`)
+      .join("\n");
+
+    return `Recent conversation context:\n${memoryLines}\n`;
+  }
+
+  async updateSessionAIMemory(sender, receiver, aiNodeId, userMessage, assistantMessage) {
+    try {
+      const existingMemory = await this.getSessionAIMemory(sender, receiver);
+      const nextMemory = [
+        ...existingMemory,
+        { role: "user", content: userMessage, ts: new Date().toISOString() },
+        { role: "assistant", content: assistantMessage, ts: new Date().toISOString() }
+      ].slice(-12);
+
+      const expiryTime = new Date(Date.now() + 1 * 60 * 60 * 1000);
+      await db.query(
+        `UPDATE chatbot_session
+         SET source = ?, message_type = 'ai', ai = 1, ai_memory = ?, expiry_time = ?, updated_at = NOW()
+         WHERE sender_id = ? AND receiver_id = ?`,
+        [aiNodeId, JSON.stringify(nextMemory), expiryTime, sender, receiver]
+      );
+    } catch (error) {
+      if (this.isUnknownColumnError(error)) {
+        await this.keepUserInAINode(aiNodeId, sender, receiver);
+        return;
+      }
+      logger.error(`❌ Failed to update AI session memory: ${error.message}`);
+      throw error;
+    }
+  }
+
   /**
    * Process AI Node with Enhanced Intent Recognition and Session Management
    */
@@ -38,6 +104,7 @@ class ChatbotService {
       const smartRoutes = JSON.parse(aiNode.data.smartRoutes || "[]");
       const systemPrompt = aiNode.data.systemPrompt || "You are a helpful assistant.";
       const fallbackMessage = aiNode.data.fallbackMessage || "I'm sorry, I couldn't understand that. Please try again.";
+      const aiMemory = await this.getSessionAIMemory(sender, receiver);
 
       logger.info(`📊 Smart routes configured: ${smartRoutes.length}`);
 
@@ -55,7 +122,7 @@ class ChatbotService {
         });
 
         await this.sendFallbackMessage(receiver, fallbackMessage, apiUrl, accessToken, sender, flowId, sendername, username);
-        await this.keepUserInAINode(aiNode.id, sender, receiver);
+        await this.updateSessionAIMemory(sender, receiver, aiNode.id, userMessage, fallbackMessage);
         return;
       }
 
@@ -78,17 +145,19 @@ class ChatbotService {
           break;
         case 'chatbot':
           // Pass the node's systemPrompt so the reply stays grounded in the configured role
-          await this.executeChatbotAction(matchedRoute, userMessage, receiver, apiUrl, accessToken, sender, flowId, sendername, username, sessionId, systemPrompt);
-          await this.keepUserInAINode(aiNode.id, sender, receiver);
+          {
+            const assistantMessage = await this.executeChatbotAction(matchedRoute, userMessage, receiver, apiUrl, accessToken, sender, flowId, sendername, username, sessionId, systemPrompt, aiMemory);
+            await this.updateSessionAIMemory(sender, receiver, aiNode.id, userMessage, assistantMessage);
+          }
           break;
         case 'api':
           await this.executeApiAction(matchedRoute, userMessage, receiver, apiUrl, accessToken, sender, flowId, sendername, username);
-          await this.keepUserInAINode(aiNode.id, sender, receiver);
+          await this.updateSessionAIMemory(sender, receiver, aiNode.id, userMessage, "API response sent");
           await this.updateAIUsageLog(sessionId, { status: 'api_call_completed', endTime: new Date() });
           break;
         default:
           await this.sendFallbackMessage(receiver, fallbackMessage, apiUrl, accessToken, sender, flowId, sendername, username);
-          await this.keepUserInAINode(aiNode.id, sender, receiver);
+          await this.updateSessionAIMemory(sender, receiver, aiNode.id, userMessage, fallbackMessage);
           await this.updateAIUsageLog(sessionId, { status: 'unknown_action_type', error: `Unknown action type: ${matchedRoute.actionType}` });
       }
 
@@ -130,12 +199,22 @@ class ChatbotService {
       const expiryTime = new Date(Date.now() + 1 * 60 * 60 * 1000); // 1 hour
       await db.query(
         `UPDATE chatbot_session 
-         SET source = ?, message_type = 'ai', expiry_time = ?, updated_at = NOW() 
+         SET source = ?, message_type = 'ai', ai = 1, expiry_time = ?, updated_at = NOW() 
          WHERE sender_id = ? AND receiver_id = ?`,
         [aiNodeId, expiryTime, sender, receiver]
       );
       logger.info(`✅ User session maintained in AI node ${aiNodeId} for continued conversation`);
     } catch (error) {
+      if (this.isUnknownColumnError(error)) {
+        await db.query(
+          `UPDATE chatbot_session 
+           SET source = ?, message_type = 'ai', expiry_time = ?, updated_at = NOW() 
+           WHERE sender_id = ? AND receiver_id = ?`,
+          [aiNodeId, expiryTime, sender, receiver]
+        );
+        logger.info(`✅ User session maintained in AI node ${aiNodeId} for continued conversation`);
+        return;
+      }
       logger.error("❌ Failed to keep user in AI node:", error.message);
       throw error;
     }
@@ -608,12 +687,25 @@ If no route matches well (confidence < 0.4), return:
     logger.info(`🚀 Executing node action: Navigating to node ${targetNodeId}`);
 
     const expiryTime = new Date(Date.now() + 1 * 60 * 60 * 1000);
-    await db.query(
-      `UPDATE chatbot_session 
-       SET source = ?, message_type = ?, expiry_time = ?, updated_at = NOW() 
-       WHERE sender_id = ? AND receiver_id = ?`,
-      [targetNodeId, 'normal', expiryTime, sender, receiver]
-    );
+    try {
+      await db.query(
+        `UPDATE chatbot_session 
+         SET source = ?, message_type = ?, ai = 0, ai_memory = NULL, expiry_time = ?, updated_at = NOW() 
+         WHERE sender_id = ? AND receiver_id = ?`,
+        [targetNodeId, 'normal', expiryTime, sender, receiver]
+      );
+    } catch (error) {
+      if (this.isUnknownColumnError(error)) {
+        await db.query(
+          `UPDATE chatbot_session 
+           SET source = ?, message_type = ?, expiry_time = ?, updated_at = NOW() 
+           WHERE sender_id = ? AND receiver_id = ?`,
+          [targetNodeId, 'normal', expiryTime, sender, receiver]
+        );
+      } else {
+        throw error;
+      }
+    }
 
     logger.info(`✅ Session updated: User will navigate to node ${targetNodeId} on next message`);
   }
@@ -622,14 +714,17 @@ If no route matches well (confidence < 0.4), return:
    * Execute Chatbot Action - Respond and stay in AI node
    * Now grounded in the node's systemPrompt so replies stay on-role.
    */
-  async executeChatbotAction(matchedRoute, userMessage, receiver, apiUrl, accessToken, sender, flowId, sendername, username, sessionId, systemPrompt = "") {
+  async executeChatbotAction(matchedRoute, userMessage, receiver, apiUrl, accessToken, sender, flowId, sendername, username, sessionId, systemPrompt = "", aiMemory = []) {
     const aiResponseTemplate = matchedRoute.actionConfig.aiResponse || "";
+    const memoryContext = this.buildMemoryContext(aiMemory);
 
     // Build a prompt that keeps the model strictly inside the configured role.
     const responsePrompt = `${systemPrompt}
 
 ---
 A user message matched one of your routes. Use the "reply direction" only as a hint for tone/direction, but answer the user's actual question fully and accurately based on YOUR ROLE above.
+
+${memoryContext}
 
 Reply direction hint: ${aiResponseTemplate}
 User Name: ${sendername || 'Customer'}
