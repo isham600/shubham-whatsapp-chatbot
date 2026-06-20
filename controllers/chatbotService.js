@@ -930,6 +930,34 @@ Response:`;
         throw new Error("Invalid API response");
       }
 
+      // Persist bot-sent interactive message to chat_messages (fire-and-forget)
+      try {
+        const whtsRefId = response.data?.messages?.[0]?.id || null;
+        const query = `
+          INSERT INTO chat_messages
+          (username, sender_id, receiver_id, status, eventDescription, replySourceMessage,
+           text, media, type, eventtype, whts_ref_id, template_id, attributes, template_media,
+           created_at, updated_at)
+          VALUES (?, ?, ?, 1, 'Bot Replied', ?, ?, ?, ?, 'broadcastMessage', ?, ?, ?, ?, NOW(), NOW())
+        `;
+        const values = [
+          null,
+          sender,
+          receiver,
+          sendername || null,
+          message || null,
+          null,
+          'button',
+          whtsRefId,
+          null,
+          '[]',
+          null
+        ];
+        db.query(query, values).catch(err => logger.error("❌ Failed to save chat_message:", err.message));
+      } catch (saveErr) {
+        logger.error("❌ Failed to persist interactive chat_message:", saveErr.message);
+      }
+
       logger.info(`📨 Interactive AI message sent successfully: "${message.substring(0, 50)}..."`);
       return response.data;
     } catch (error) {
@@ -954,6 +982,34 @@ Response:`;
 
     if (!(response.status === 200 && response.data?.messages?.length > 0)) {
       throw new Error("Invalid API response");
+    }
+
+    // Persist bot-sent text message to chat_messages (fire-and-forget)
+    try {
+      const whtsRefId = response.data?.messages?.[0]?.id || null;
+      const query = `
+        INSERT INTO chat_messages
+        (username, sender_id, receiver_id, status, eventDescription, replySourceMessage,
+         text, media, type, eventtype, whts_ref_id, template_id, attributes, template_media,
+         created_at, updated_at)
+        VALUES (?, ?, ?, 1, 'Bot Replied', ?, ?, ?, ?, 'broadcastMessage', ?, ?, ?, ?, NOW(), NOW())
+      `;
+      const values = [
+        null,
+        sender,
+        receiver,
+        sendername || null,
+        message || null,
+        null,
+        'text',
+        whtsRefId,
+        null,
+        '[]',
+        null
+      ];
+      db.query(query, values).catch(err => logger.error("❌ Failed to save chat_message:", err.message));
+    } catch (saveErr) {
+      logger.error("❌ Failed to persist text chat_message:", saveErr.message);
     }
 
     logger.info(`📨 Message sent successfully: "${message.substring(0, 50)}..."`);
