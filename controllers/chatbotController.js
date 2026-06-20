@@ -2,12 +2,14 @@ const db = require("../config/db"); // Database connection
 const logger = require("../utils/logger"); // Logger utility
 const stringSimilarity = require("string-similarity");
 const axios = require("axios"); // HTTP requests
+const crypto = require("crypto");
 const config = require("./config"); // Configurations (e.g., session expiry, base URLs)
 const chatbotService = require('./chatbotService');
 const redisClient = require("../utils/redis"); // Redis for caching
 
 // Cache TTL: 5 minutes
 const CACHE_TTL = 300;
+const WEBHOOK_DEDUPE_TTL_SECONDS = 15;
 
 async function getCachedUsername(sender) {
   const key = `ci_admin:${sender}`;
@@ -27,6 +29,64 @@ async function getCachedWati(username) {
   if (rows.length === 0) return null;
   await redisClient.setex(key, CACHE_TTL, JSON.stringify(rows[0]));
   return rows[0];
+}
+
+function buildWebhookFingerprint(data) {
+  const sender = data?.sender_id || "";
+  const receiver = data?.waId || "";
+  const message = typeof data?.text === "string" ? data.text.trim() : "";
+  const explicitMessageId =
+    data?.messageId ||
+    data?.message_id ||
+    data?.id ||
+    data?.eventId ||
+    data?.event_id ||
+    data?.localMessageId ||
+    data?.local_message_id ||
+    "";
+
+  const fingerprintSource = explicitMessageId || [
+    sender,
+    receiver,
+    message,
+    data?.type || "",
+    data?.eventType || "",
+    data?.created || "",
+    data?.createdAt || "",
+    data?.timestamp || ""
+  ].join("|");
+
+  return crypto.createHash("sha1").update(fingerprintSource).digest("hex");
+}
+
+async function acquireWebhookProcessingLock(data) {
+  try {
+    const fingerprint = buildWebhookFingerprint(data);
+    const dedupeKey = `chatbot:webhook:${fingerprint}`;
+    const result = await redisClient.set(
+      dedupeKey,
+      JSON.stringify({
+        sender: data?.sender_id || null,
+        receiver: data?.waId || null,
+        message: data?.text || null,
+        createdAt: new Date().toISOString()
+      }),
+      "EX",
+      WEBHOOK_DEDUPE_TTL_SECONDS,
+      "NX"
+    );
+
+    return {
+      fingerprint,
+      acquired: result === "OK"
+    };
+  } catch (error) {
+    logger.error(`❌ Webhook dedupe lock failed: ${error.message}`);
+    return {
+      fingerprint: null,
+      acquired: true
+    };
+  }
 }
 
 /** ========================================================================
@@ -155,9 +215,30 @@ async function processWebhookInBackground(data, ipAddress, userAgent) {
   const receiver = data.waId || "Unknown Receiver";
   const message = data.text || "No Message";
   const sendername = data.senderName || "Unknown User";
+  const lockResult = await acquireWebhookProcessingLock(data);
 
   logger.info(`➡️ Incoming Webhook - Sender ID: ${sender}, Receiver ID: ${receiver}`);
   logger.info(`🔹📩 Sender: ${sender}, 📩 Receiver: ${receiver}, 📩 Message: "${message}"`);
+
+  if (!lockResult.acquired) {
+    logger.warn(`⚠️ Duplicate webhook skipped for ${sender} -> ${receiver}`);
+    logToPM2({
+      username: 'system',
+      senderId: sender,
+      receiverId: receiver,
+      senderName: sendername,
+      logType: 'duplicate_webhook_skipped',
+      logLevel: 'warning',
+      message: 'Duplicate webhook ignored by dedupe lock',
+      userMessage: message,
+      metadata: {
+        fingerprint: lockResult.fingerprint
+      },
+      ipAddress,
+      userAgent
+    });
+    return;
+  }
 
   try {
     logToPM2({
@@ -322,7 +403,92 @@ async function processWebhookInBackground(data, ipAddress, userAgent) {
       }
 
       // ✅ CASE 3: AI node response handling
-      if (session.message_type === "ai") {
+//       if (session.message_type === "ai") {
+//         await logToPM2({
+//           username,
+//           flowId: session.flow_id,
+//           nodeId: session.source,
+//           senderId: sender,
+//           receiverId: receiver,
+//           senderName: sendername,
+//           logType: 'ai_continued_conversation',
+//           logLevel: 'info',
+//           message: 'User continuing conversation in AI node',
+//           userMessage: message,
+//           sessionData: session
+//         });
+
+//         // Process the message through the AI node
+//         const [stepsRows] = await db.query("SELECT nodes FROM chatbot_steps WHERE flow_id = ?", [session.flow_id]);
+//         if (stepsRows.length > 0) {
+//           const nodes = JSON.parse(stepsRows[0].nodes || "[]");
+//           const aiNode = nodes.find(node => node.id === session.source);
+
+//           if (aiNode && aiNode.type === "ai") {
+//             await processAINode(aiNode, receiver, META_API_URL, ACCESS_TOKEN, session.flow_id, sender, [], sendername, username);
+//             return;
+//           }
+//         }
+
+//         // Fallback if AI node not found
+//         await sendTextMessage(receiver, "I'm sorry, there was an issue processing your message. Please try again.", META_API_URL, ACCESS_TOKEN, sender, session.flow_id, sendername);
+//         return;
+//       }
+
+// ✅ CASE 3: AI node response handling (continued conversation / looping)
+if (session.message_type === "ai") {
+  await logToPM2({
+    username,
+    flowId: session.flow_id,
+    nodeId: session.source,
+    senderId: sender,
+    receiverId: receiver,
+    senderName: sendername,
+    logType: 'ai_continued_conversation',
+    logLevel: 'info',
+    message: 'User continuing conversation in AI node',
+    userMessage: message,
+    sessionData: session
+  });
+
+  const [stepsRows] = await db.query(
+    "SELECT nodes, edges FROM chatbot_steps WHERE flow_id = ?",
+    [session.flow_id]
+  );
+
+  if (stepsRows.length > 0) {
+    const nodes = JSON.parse(stepsRows[0].nodes || "[]");
+    const edges = JSON.parse(stepsRows[0].edges || "[]");
+    const aiNode = nodes.find(node => node.id === session.source);
+
+    if (aiNode && aiNode.type === "ai") {
+      // Live incoming message bhejo (DB se stale value nahi).
+      // chatbotService.processAINode andar keepUserInAINode() call karta hai,
+      // jo message_type = 'ai' maintain rakhta hai -> agla message bhi yahi loop me aayega.
+      await chatbotService.processAINode(
+        aiNode,
+        message,
+        sender,
+        receiver,
+        session.flow_id,
+        META_API_URL,
+        ACCESS_TOKEN,
+        sendername,
+        username,
+        nodes,
+        edges
+      );
+      processedSession = true;
+      return;
+    }
+  }
+
+  await sendTextMessage(receiver, "I'm sorry, there was an issue processing your message. Please try again.", META_API_URL, ACCESS_TOKEN, sender, session.flow_id, sendername);
+  return;
+}
+
+      // ✅ CASE 4: Resume a stored normal node on the next user message
+      if (session.message_type === "normal" && session.source) {
         await logToPM2({
           username,
           flowId: session.flow_id,
@@ -330,31 +496,42 @@ async function processWebhookInBackground(data, ipAddress, userAgent) {
           senderId: sender,
           receiverId: receiver,
           senderName: sendername,
-          logType: 'ai_continued_conversation',
+          logType: 'flow_resumed',
           logLevel: 'info',
-          message: 'User continuing conversation in AI node',
+          message: `Resuming stored node: ${session.source}`,
           userMessage: message,
           sessionData: session
         });
 
-        // Process the message through the AI node
-        const [stepsRows] = await db.query("SELECT nodes FROM chatbot_steps WHERE flow_id = ?", [session.flow_id]);
-        if (stepsRows.length > 0) {
-          const nodes = JSON.parse(stepsRows[0].nodes || "[]");
-          const aiNode = nodes.find(node => node.id === session.source);
+        const [stepsRows] = await db.query(
+          "SELECT nodes, edges FROM chatbot_steps WHERE flow_id = ?",
+          [session.flow_id]
+        );
 
-          if (aiNode && aiNode.type === "ai") {
-            await processAINode(aiNode, receiver, META_API_URL, ACCESS_TOKEN, session.flow_id, sender, [], sendername, username);
+        if (stepsRows.length > 0) {
+          const edges = JSON.parse(stepsRows[0].edges || "[]");
+          if (session.source) {
+            await processChatbotFlow(
+              {
+                flowId: session.flow_id,
+                lastNodeId: session.source,
+                sourceHandles: edges
+              },
+              message,
+              sender,
+              receiver,
+              META_API_URL,
+              ACCESS_TOKEN,
+              sendername,
+              username
+            );
+            processedSession = true;
             return;
           }
         }
-
-        // Fallback if AI node not found
-        await sendTextMessage(receiver, "I'm sorry, there was an issue processing your message. Please try again.", META_API_URL, ACCESS_TOKEN, sender, session.flow_id, sendername);
-        return;
       }
 
-      // ✅ CASE 4: Question response handling
+      // ✅ CASE 5: Question response handling
       if (session.message_type === "question") {
         await logToPM2({
           username,
@@ -849,7 +1026,9 @@ async function processChatbotFlow(
         throw new Error(`❌ Node with ID: ${currentNodeId} not found.`);
       }
 
-      const isPauseNode = ["buttons", "list", "question"].includes(currentNode.type);
+      // AI nodes must pause the outer flow so the conversation can keep looping
+      // through the same AI node on subsequent user messages.
+      const isPauseNode = ["buttons", "list", "question", "ai"].includes(currentNode.type);
 
       await handleSession(
         sender,
@@ -1074,7 +1253,7 @@ async function processAINode(currentNode, receiver, apiUrl, accessToken, flowId,
     }
 
     // Get all nodes for the AI service
-    const [stepsRows] = await db.query("SELECT nodes FROM chatbot_steps WHERE flow_id = ?", [flowId]);
+    const [stepsRows] = await db.query("SELECT nodes, edges FROM chatbot_steps WHERE flow_id = ?", [flowId]);
     
     if (!stepsRows.length) {
       throw new Error(`No steps found for Flow ID: ${flowId}`);
@@ -1154,11 +1333,307 @@ async function processAINode(currentNode, receiver, apiUrl, accessToken, flowId,
 
 // Add this function anywhere in your chatbotController.js file:
 
+// async function processAINodeSimple(currentNode, receiver, apiUrl, accessToken, flowId, sender, edges, sendername, username) {
+//   const startTime = Date.now();
+  
+//   try {
+//     // Get user's last response
+//     const [responseRows] = await db.query(
+//       `SELECT variable_value FROM chatbot_question 
+//        WHERE sender_id = ? AND receiver_id = ? AND flow_id = ? 
+//        ORDER BY created_at DESC LIMIT 1`,
+//       [sender, receiver, flowId]
+//     );
+
+//     const userMessage = responseRows.length > 0 ? responseRows[0].variable_value : "";
+    
+//     if (!userMessage) {
+//       logger.error("No user message found for AI processing");
+//       const fallbackMsg = currentNode.data.fallbackMessage || "Please try again.";
+//       await sendTextMessage(receiver, fallbackMsg, apiUrl, accessToken, sender, flowId, sendername);
+//       return;
+//     }
+
+//     logger.info(`AI Processing message: "${userMessage}"`);
+
+//     await logToPM2({
+//       username,
+//       flowId,
+//       nodeId: currentNode.id,
+//       senderId: sender,
+//       receiverId: receiver,
+//       senderName: sendername,
+//       logType: 'ai_processing_started',
+//       message: 'AI processing started',
+//       userMessage,
+//       metadata: { userMessage }
+//     });
+
+//     // Parse smart routes
+//     const smartRoutes = JSON.parse(currentNode.data.smartRoutes || "[]");
+    
+//     // Simple keyword matching
+//     let matchedRoute = null;
+//     let bestScore = 0;
+//     let matchedKeywords = [];
+
+//     for (const route of smartRoutes) {
+//       let score = 0;
+//       let matchedWords = [];
+      
+//       // Extract words from intentPrompt for matching
+//       const intentPrompt = route.intentPrompt || "";
+//       const intentWords = intentPrompt.toLowerCase().split(/[\s,]+/).filter(word => word.length > 2);
+      
+//       logger.info(`🔍 Debug - Route: ${route.id}, Intent: "${intentPrompt}"`);
+//       logger.info(`🔍 Debug - Extracted words: [${intentWords.join(', ')}]`);
+      
+//       // Also create variations of words (remove hyphens, etc.)
+//       const intentWordVariations = [];
+//       for (const word of intentWords) {
+//         intentWordVariations.push(word);
+//         // Add variations without hyphens
+//         if (word.includes('-')) {
+//           intentWordVariations.push(word.replace(/-/g, ''));
+//         }
+//         // Add variations with spaces
+//         if (word.includes('-')) {
+//           intentWordVariations.push(word.replace(/-/g, ' '));
+//         }
+//       }
+      
+//       for (const word of intentWordVariations) {
+//         if (userMessage.toLowerCase().includes(word)) {
+//           score += 1;
+//           matchedWords.push(word);
+//         }
+//       }
+      
+//       // Special handling for common phrases
+//       const userMessageLower = userMessage.toLowerCase();
+//       if (intentPrompt.toLowerCase().includes('more details') && 
+//           (userMessageLower.includes('more') || userMessageLower.includes('details') || userMessageLower.includes('information'))) {
+//         score += 2; // Give extra points for "more details" intent
+//         matchedWords.push('more_details_intent');
+//       }
+      
+//       if (intentPrompt.toLowerCase().includes('connect') && 
+//           (userMessageLower.includes('connect') || userMessageLower.includes('call') || userMessageLower.includes('speak'))) {
+//         score += 2; // Give extra points for "connect" intent
+//         matchedWords.push('connect_intent');
+//       }
+      
+//       const confidence = intentWords.length > 0 ? score / intentWords.length : 0;
+      
+//       logger.info(`🔍 Debug - Route ${route.id}: score=${score}, confidence=${confidence}, matchedWords=[${matchedWords.join(', ')}]`);
+      
+//       if (confidence > bestScore && confidence >= 0.1) {
+//         bestScore = confidence;
+//         matchedRoute = route;
+//         matchedKeywords = matchedWords;
+//         logger.info(`✅ Debug - Route ${route.id} selected with confidence ${confidence}`);
+//       }
+//     }
+
+//     if (!matchedRoute) {
+//       logger.info("No route matched, generating AI response for general question");
+      
+//       await logToPM2({
+//         username,
+//         flowId,
+//         nodeId: currentNode.id,
+//         senderId: sender,
+//         receiverId: receiver,
+//         senderName: sendername,
+//         logType: 'ai_general_response',
+//         message: 'No specific route matched, generating general AI response',
+//         userMessage,
+//         metadata: { reason: 'general_question' }
+//       });
+      
+//       // Generate AI response for general questions
+//       try {
+//         const generalPrompt = `You are a helpful customer support assistant for CodeCanvas. 
+        
+// User Question: "${userMessage}"
+// User Name: ${sendername || 'Customer'}
+
+// Instructions:
+// - Provide a helpful, accurate response about CodeCanvas
+// - Keep response under 1000 characters for WhatsApp
+// - Be friendly and professional
+// - If you don't know something, suggest they visit https://codecanvas.org.in/
+// - Encourage them to ask more specific questions
+
+// Response:`;
+
+//         const aiResponse = await chatbotService.callAI(generalPrompt, `general_${Date.now()}`);
+        
+//         // Clean up response
+//         let finalResponse = aiResponse
+//           .replace(/^(Response:|Here('|')s|Here is)/i, '')
+//           .replace(/^["\']|["\']$/g, '')
+//           .trim();
+        
+//         if (finalResponse.length > 1000) {
+//           finalResponse = finalResponse.substring(0, 997) + "...";
+//         }
+        
+//         await sendTextMessage(receiver, finalResponse, apiUrl, accessToken, sender, flowId, sendername);
+//         logger.info(`✅ Generated general AI response: ${finalResponse.substring(0, 100)}...`);
+        
+//       } catch (aiError) {
+//         logger.warn("⚠️ AI response generation failed:", aiError.message);
+//         const fallbackMsg = currentNode.data.fallbackMessage || "I'm sorry, I couldn't understand that. Please try again.";
+//         await sendTextMessage(receiver, fallbackMsg, apiUrl, accessToken, sender, flowId, sendername);
+//       }
+      
+//       // Keep user in AI node for continued conversation
+//       await updateSessionSource(sender, receiver, currentNode.id);
+//       logger.info("✅ User kept in AI node after general response - ready for continued conversation");
+//       return;
+//     }
+
+//     logger.info(`Route matched: ${matchedRoute.actionType}, confidence: ${bestScore}, keywords: ${matchedKeywords.join(', ')}`);
+
+//     await logToPM2({
+//       username,
+//       flowId,
+//       nodeId: currentNode.id,
+//       senderId: sender,
+//       receiverId: receiver,
+//       senderName: sendername,
+//       logType: 'ai_route_matched',
+//       message: `AI route matched: ${matchedRoute.actionType}`,
+//       userMessage,
+//       metadata: {
+//         actionType: matchedRoute.actionType,
+//         confidence: bestScore,
+//         matchedKeywords,
+//         routeId: matchedRoute.id
+//       }
+//     });
+
+//     // Execute action
+//     switch (matchedRoute.actionType) {
+//       case 'node':
+//         logger.info(`Redirecting to node: ${matchedRoute.actionConfig.nodeId}`);
+        
+//         await logToPM2({
+//           username,
+//           flowId,
+//           nodeId: matchedRoute.actionConfig.nodeId,
+//           senderId: sender,
+//           receiverId: receiver,
+//           senderName: sendername,
+//           logType: 'ai_node_redirect',
+//           message: `AI redirecting to node: ${matchedRoute.actionConfig.nodeId}`,
+//           userMessage,
+//           metadata: { targetNodeId: matchedRoute.actionConfig.nodeId }
+//         });
+        
+//         // Update session
+//         await updateSessionSource(sender, receiver, matchedRoute.actionConfig.nodeId);
+        
+//         // Get and process target node
+//         const [stepsRows] = await db.query("SELECT nodes FROM chatbot_steps WHERE flow_id = ?", [flowId]);
+//         if (stepsRows.length > 0) {
+//           const nodes = JSON.parse(stepsRows[0].nodes || "[]");
+//           const targetNode = nodes.find(node => node.id === matchedRoute.actionConfig.nodeId);
+          
+//           if (targetNode) {
+//             await processNode(targetNode, receiver, apiUrl, accessToken, flowId, sender, edges, sendername, username);
+//           } else {
+//             logger.error(`Target node ${matchedRoute.actionConfig.nodeId} not found`);
+//           }
+//         }
+//         break;
+
+//    case 'chatbot':
+//   logger.info("Sending AI-powered chatbot response via service");
+  
+//   // Use the chatbot service for proper AI response generation
+//   await chatbotService.executeChatbotAction(
+//     matchedRoute, 
+//     userMessage, 
+//     receiver, 
+//     apiUrl, 
+//     accessToken, 
+//     sender, 
+//     flowId, 
+//     sendername, 
+//     username
+//   );
+  
+//   break;
+
+//       case 'api':
+//         logger.info("API action triggered");
+        
+//         await logToPM2({
+//           username,
+//           flowId,
+//           nodeId: currentNode.id,
+//           senderId: sender,
+//           receiverId: receiver,
+//           senderName: sendername,
+//           logType: 'ai_api_triggered',
+//           message: 'AI API action triggered',
+//           userMessage,
+//           metadata: { apiConfig: matchedRoute.actionConfig }
+//         });
+        
+//         const apiMsg = "I'm fetching that information for you. Please wait...";
+//         await sendTextMessage(receiver, apiMsg, apiUrl, accessToken, sender, flowId, sendername);
+//         // TODO: Implement actual API calls later
+//         break;
+//     }
+
+//     await logToPM2({
+//       username,
+//       flowId,
+//       nodeId: currentNode.id,
+//       senderId: sender,
+//       receiverId: receiver,
+//       senderName: sendername,
+//       logType: 'ai_processing_completed',
+//       message: 'AI processing completed successfully',
+//       userMessage,
+//       processingTime: (Date.now() - startTime) / 1000,
+//       metadata: {
+//         actionType: matchedRoute ? matchedRoute.actionType : 'fallback',
+//         confidence: bestScore,
+//         matchedKeywords
+//       }
+//     });
+
+//   } catch (error) {
+//     logger.error("AI processing error:", error.message);
+    
+//     await logToPM2({
+//       username,
+//       flowId,
+//       nodeId: currentNode.id,
+//       senderId: sender,
+//       receiverId: receiver,
+//       senderName: sendername,
+//       logType: 'ai_processing_error',
+//       logLevel: 'error',
+//       message: `AI processing failed: ${error.message}`,
+//       errorDetails: error.stack,
+//       processingTime: (Date.now() - startTime) / 1000
+//     });
+    
+//     const fallbackMsg = currentNode.data.fallbackMessage || "Something went wrong. Please try again.";
+//     await sendTextMessage(receiver, fallbackMsg, apiUrl, accessToken, sender, flowId, sendername);
+//   }
+// }
+
 async function processAINodeSimple(currentNode, receiver, apiUrl, accessToken, flowId, sender, edges, sendername, username) {
   const startTime = Date.now();
-  
+
   try {
-    // Get user's last response
+    // Question node ne abhi user ka message store kiya hai — wahi uthao.
     const [responseRows] = await db.query(
       `SELECT variable_value FROM chatbot_question 
        WHERE sender_id = ? AND receiver_id = ? AND flow_id = ? 
@@ -1167,11 +1642,13 @@ async function processAINodeSimple(currentNode, receiver, apiUrl, accessToken, f
     );
 
     const userMessage = responseRows.length > 0 ? responseRows[0].variable_value : "";
-    
+
     if (!userMessage) {
       logger.error("No user message found for AI processing");
       const fallbackMsg = currentNode.data.fallbackMessage || "Please try again.";
       await sendTextMessage(receiver, fallbackMsg, apiUrl, accessToken, sender, flowId, sendername);
+      // user ko AI node me hi rakho taaki loop chale
+      await chatbotService.keepUserInAINode(currentNode.id, sender, receiver);
       return;
     }
 
@@ -1190,225 +1667,23 @@ async function processAINodeSimple(currentNode, receiver, apiUrl, accessToken, f
       metadata: { userMessage }
     });
 
-    // Parse smart routes
-    const smartRoutes = JSON.parse(currentNode.data.smartRoutes || "[]");
-    
-    // Simple keyword matching
-    let matchedRoute = null;
-    let bestScore = 0;
-    let matchedKeywords = [];
+    const [stepsRows] = await db.query("SELECT nodes, edges FROM chatbot_steps WHERE flow_id = ?", [flowId]);
+    const nodes = stepsRows.length ? JSON.parse(stepsRows[0].nodes || "[]") : [];
 
-    for (const route of smartRoutes) {
-      let score = 0;
-      let matchedWords = [];
-      
-      // Extract words from intentPrompt for matching
-      const intentPrompt = route.intentPrompt || "";
-      const intentWords = intentPrompt.toLowerCase().split(/[\s,]+/).filter(word => word.length > 2);
-      
-      logger.info(`🔍 Debug - Route: ${route.id}, Intent: "${intentPrompt}"`);
-      logger.info(`🔍 Debug - Extracted words: [${intentWords.join(', ')}]`);
-      
-      // Also create variations of words (remove hyphens, etc.)
-      const intentWordVariations = [];
-      for (const word of intentWords) {
-        intentWordVariations.push(word);
-        // Add variations without hyphens
-        if (word.includes('-')) {
-          intentWordVariations.push(word.replace(/-/g, ''));
-        }
-        // Add variations with spaces
-        if (word.includes('-')) {
-          intentWordVariations.push(word.replace(/-/g, ' '));
-        }
-      }
-      
-      for (const word of intentWordVariations) {
-        if (userMessage.toLowerCase().includes(word)) {
-          score += 1;
-          matchedWords.push(word);
-        }
-      }
-      
-      // Special handling for common phrases
-      const userMessageLower = userMessage.toLowerCase();
-      if (intentPrompt.toLowerCase().includes('more details') && 
-          (userMessageLower.includes('more') || userMessageLower.includes('details') || userMessageLower.includes('information'))) {
-        score += 2; // Give extra points for "more details" intent
-        matchedWords.push('more_details_intent');
-      }
-      
-      if (intentPrompt.toLowerCase().includes('connect') && 
-          (userMessageLower.includes('connect') || userMessageLower.includes('call') || userMessageLower.includes('speak'))) {
-        score += 2; // Give extra points for "connect" intent
-        matchedWords.push('connect_intent');
-      }
-      
-      const confidence = intentWords.length > 0 ? score / intentWords.length : 0;
-      
-      logger.info(`🔍 Debug - Route ${route.id}: score=${score}, confidence=${confidence}, matchedWords=[${matchedWords.join(', ')}]`);
-      
-      if (confidence > bestScore && confidence >= 0.1) {
-        bestScore = confidence;
-        matchedRoute = route;
-        matchedKeywords = matchedWords;
-        logger.info(`✅ Debug - Route ${route.id} selected with confidence ${confidence}`);
-      }
-    }
-
-    if (!matchedRoute) {
-      logger.info("No route matched, generating AI response for general question");
-      
-      await logToPM2({
-        username,
-        flowId,
-        nodeId: currentNode.id,
-        senderId: sender,
-        receiverId: receiver,
-        senderName: sendername,
-        logType: 'ai_general_response',
-        message: 'No specific route matched, generating general AI response',
-        userMessage,
-        metadata: { reason: 'general_question' }
-      });
-      
-      // Generate AI response for general questions
-      try {
-        const generalPrompt = `You are a helpful customer support assistant for CodeCanvas. 
-        
-User Question: "${userMessage}"
-User Name: ${sendername || 'Customer'}
-
-Instructions:
-- Provide a helpful, accurate response about CodeCanvas
-- Keep response under 1000 characters for WhatsApp
-- Be friendly and professional
-- If you don't know something, suggest they visit https://codecanvas.org.in/
-- Encourage them to ask more specific questions
-
-Response:`;
-
-        const aiResponse = await chatbotService.callAI(generalPrompt, `general_${Date.now()}`);
-        
-        // Clean up response
-        let finalResponse = aiResponse
-          .replace(/^(Response:|Here('|')s|Here is)/i, '')
-          .replace(/^["\']|["\']$/g, '')
-          .trim();
-        
-        if (finalResponse.length > 1000) {
-          finalResponse = finalResponse.substring(0, 997) + "...";
-        }
-        
-        await sendTextMessage(receiver, finalResponse, apiUrl, accessToken, sender, flowId, sendername);
-        logger.info(`✅ Generated general AI response: ${finalResponse.substring(0, 100)}...`);
-        
-      } catch (aiError) {
-        logger.warn("⚠️ AI response generation failed:", aiError.message);
-        const fallbackMsg = currentNode.data.fallbackMessage || "I'm sorry, I couldn't understand that. Please try again.";
-        await sendTextMessage(receiver, fallbackMsg, apiUrl, accessToken, sender, flowId, sendername);
-      }
-      
-      // Keep user in AI node for continued conversation
-      await updateSessionSource(sender, receiver, currentNode.id);
-      logger.info("✅ User kept in AI node after general response - ready for continued conversation");
-      return;
-    }
-
-    logger.info(`Route matched: ${matchedRoute.actionType}, confidence: ${bestScore}, keywords: ${matchedKeywords.join(', ')}`);
-
-    await logToPM2({
-      username,
-      flowId,
-      nodeId: currentNode.id,
-      senderId: sender,
-      receiverId: receiver,
-      senderName: sendername,
-      logType: 'ai_route_matched',
-      message: `AI route matched: ${matchedRoute.actionType}`,
+    // Saari AI logic (intent analysis + grounded reply + keepUserInAINode) service handle karega.
+    await chatbotService.processAINode(
+      currentNode,
       userMessage,
-      metadata: {
-        actionType: matchedRoute.actionType,
-        confidence: bestScore,
-        matchedKeywords,
-        routeId: matchedRoute.id
-      }
-    });
-
-    // Execute action
-    switch (matchedRoute.actionType) {
-      case 'node':
-        logger.info(`Redirecting to node: ${matchedRoute.actionConfig.nodeId}`);
-        
-        await logToPM2({
-          username,
-          flowId,
-          nodeId: matchedRoute.actionConfig.nodeId,
-          senderId: sender,
-          receiverId: receiver,
-          senderName: sendername,
-          logType: 'ai_node_redirect',
-          message: `AI redirecting to node: ${matchedRoute.actionConfig.nodeId}`,
-          userMessage,
-          metadata: { targetNodeId: matchedRoute.actionConfig.nodeId }
-        });
-        
-        // Update session
-        await updateSessionSource(sender, receiver, matchedRoute.actionConfig.nodeId);
-        
-        // Get and process target node
-        const [stepsRows] = await db.query("SELECT nodes FROM chatbot_steps WHERE flow_id = ?", [flowId]);
-        if (stepsRows.length > 0) {
-          const nodes = JSON.parse(stepsRows[0].nodes || "[]");
-          const targetNode = nodes.find(node => node.id === matchedRoute.actionConfig.nodeId);
-          
-          if (targetNode) {
-            await processNode(targetNode, receiver, apiUrl, accessToken, flowId, sender, edges, sendername, username);
-          } else {
-            logger.error(`Target node ${matchedRoute.actionConfig.nodeId} not found`);
-          }
-        }
-        break;
-
-   case 'chatbot':
-  logger.info("Sending AI-powered chatbot response via service");
-  
-  // Use the chatbot service for proper AI response generation
-  await chatbotService.executeChatbotAction(
-    matchedRoute, 
-    userMessage, 
-    receiver, 
-    apiUrl, 
-    accessToken, 
-    sender, 
-    flowId, 
-    sendername, 
-    username
-  );
-  
-  break;
-
-      case 'api':
-        logger.info("API action triggered");
-        
-        await logToPM2({
-          username,
-          flowId,
-          nodeId: currentNode.id,
-          senderId: sender,
-          receiverId: receiver,
-          senderName: sendername,
-          logType: 'ai_api_triggered',
-          message: 'AI API action triggered',
-          userMessage,
-          metadata: { apiConfig: matchedRoute.actionConfig }
-        });
-        
-        const apiMsg = "I'm fetching that information for you. Please wait...";
-        await sendTextMessage(receiver, apiMsg, apiUrl, accessToken, sender, flowId, sendername);
-        // TODO: Implement actual API calls later
-        break;
-    }
+      sender,
+      receiver,
+      flowId,
+      apiUrl,
+      accessToken,
+      sendername,
+      username,
+      nodes,
+      edges
+    );
 
     await logToPM2({
       username,
@@ -1420,17 +1695,12 @@ Response:`;
       logType: 'ai_processing_completed',
       message: 'AI processing completed successfully',
       userMessage,
-      processingTime: (Date.now() - startTime) / 1000,
-      metadata: {
-        actionType: matchedRoute ? matchedRoute.actionType : 'fallback',
-        confidence: bestScore,
-        matchedKeywords
-      }
+      processingTime: (Date.now() - startTime) / 1000
     });
 
   } catch (error) {
     logger.error("AI processing error:", error.message);
-    
+
     await logToPM2({
       username,
       flowId,
@@ -1444,7 +1714,7 @@ Response:`;
       errorDetails: error.stack,
       processingTime: (Date.now() - startTime) / 1000
     });
-    
+
     const fallbackMsg = currentNode.data.fallbackMessage || "Something went wrong. Please try again.";
     await sendTextMessage(receiver, fallbackMsg, apiUrl, accessToken, sender, flowId, sendername);
   }
@@ -3726,6 +3996,7 @@ async function processNextNode(nextNode, sender, receiver, flowId, message, apiU
     }
 
     const nodes = JSON.parse(stepsRows[0].nodes || "[]");
+    const edges = JSON.parse(stepsRows[0].edges || "[]");
     const nextNodeDetails = nodes.find((node) => node.id === nextNode);
 
     if (!nextNodeDetails) {
@@ -3754,7 +4025,7 @@ async function processNextNode(nextNode, sender, receiver, flowId, message, apiU
       accessToken,
       flowId,
       sender,
-      [],
+      edges,
       sendername,
       username
     );
@@ -4097,4 +4368,3 @@ async function insertLog(flowId, username, sender, receiver, errorType, errorMes
     logger.error("❌ Failed to insert log into 'chatbot_logs' table:", logError.message);
   }
 }
-
