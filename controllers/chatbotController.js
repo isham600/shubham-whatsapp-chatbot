@@ -309,10 +309,24 @@ async function processWebhookInBackground(data, ipAddress, userAgent) {
      * ✅ STEP 3: SEARCH THROUGH ALL ACTIVE SESSIONS
      * ======================================================================== */
     logger.info("🔍 Searching for all active sessions for sender and receiver...");
-    const [allSessions] = await db.query(
+    const [sessionRows] = await db.query(
       "SELECT * FROM chatbot_session WHERE sender_id = ? AND receiver_id = ? ORDER BY updated_at DESC",
       [sender, receiver]
     );
+    let allSessions = sessionRows;
+
+    if (allSessions.length > 1) {
+      const latestSession = allSessions[0];
+      const duplicateSessionIds = allSessions.slice(1).map((session) => session.id);
+
+      await db.query(
+        `DELETE FROM chatbot_session WHERE id IN (${duplicateSessionIds.map(() => "?").join(",")})`,
+        duplicateSessionIds
+      );
+
+      logger.warn(`⚠️ Removed ${duplicateSessionIds.length} duplicate session(s) for ${sender} -> ${receiver}`);
+      allSessions = [latestSession];
+    }
 
     let processedSession = false;
 
@@ -3507,16 +3521,14 @@ async function handleSession(sender, receiver, source, flowId, messageType, trig
 
     if (existingSessions.length > 0) {
       const existingSession = existingSessions[0];
-      if (existingSession.trigger_key === triggerKey) {
-        const expiryTime = new Date(Date.now() + 1 * 60 * 60 * 1000);
-        await db.query(
-          `UPDATE chatbot_session 
-           SET source = ?, message_type = ?, sourceHandle = ?, expiry_time = ?, updated_at = NOW() 
-           WHERE id = ?`,
-          [source, messageType, sourceHandlesStr, expiryTime, existingSession.id]
-        );
-        return;
-      }
+      const expiryTime = new Date(Date.now() + 1 * 60 * 60 * 1000);
+      await db.query(
+        `UPDATE chatbot_session 
+         SET flow_id = ?, source = ?, message_type = ?, trigger_key = ?, sourceHandle = ?, expiry_time = ?, updated_at = NOW() 
+         WHERE id = ?`,
+        [flowId, source, messageType, triggerKey, sourceHandlesStr, expiryTime, existingSession.id]
+      );
+      return;
     }
 
     const expiryTime = new Date(Date.now() + 1 * 60 * 60 * 1000);
