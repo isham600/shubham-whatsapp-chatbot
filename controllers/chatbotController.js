@@ -1796,9 +1796,11 @@ async function processSendMessageNode(currentNode, receiver, apiUrl, accessToken
   
   try {
     // Process media if present
-    if (currentNode.data.mediaType && currentNode.data.mediaFile) {
-      const mediaArray = JSON.parse(currentNode.data.mediaFile);
-      
+    if (currentNode.data.mediaType && currentNode.data.mediaType !== "text" && currentNode.data.mediaFile) {
+      const mediaArray = typeof currentNode.data.mediaFile === "string"
+        ? JSON.parse(currentNode.data.mediaFile || "[]")
+        : currentNode.data.mediaFile;
+
       if (mediaArray.length > 0) {
         for (const media of mediaArray) {
           const mediaType = getMediaTypeFromUrl(media.media);
