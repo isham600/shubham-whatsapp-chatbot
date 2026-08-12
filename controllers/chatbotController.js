@@ -1904,7 +1904,8 @@ async function processButtonsNode(node, receiver, apiUrl, accessToken, sender, f
     const finalBody = await replaceVariables(bodyText, sender, receiver, flowId, {}, sendername);
     const finalFooter = footer ? await replaceVariables(footer, sender, receiver, flowId, {}, sendername) : undefined;
 
-    const parsedButtons = JSON.parse(buttons).map(async (button) => ({
+    const rawButtons = typeof buttons === "string" ? JSON.parse(buttons) : buttons;
+    const parsedButtons = rawButtons.map(async (button) => ({
       type: "reply",
       reply: {
         id: button.id,
@@ -4174,7 +4175,7 @@ async function updateSessionSource(sender, receiver, newSource) {
  * ✅ Build Button Payload
  */
 async function buildButtonPayload(receiver, header, bodyText, footer, buttons, sender, receiverId, flowId, sendername) {
-  const parsedButtons = JSON.parse(buttons);
+  const parsedButtons = typeof buttons === "string" ? JSON.parse(buttons) : buttons;
 
   for (let button of parsedButtons) {
     button.text = await replaceVariables(button.text, sender, receiverId, flowId, {}, sendername);
