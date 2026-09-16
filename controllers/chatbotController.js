@@ -11,24 +11,24 @@ const redisClient = require("../utils/redis"); // Redis for caching
 const CACHE_TTL = 300;
 const WEBHOOK_DEDUPE_TTL_SECONDS = 15;
 
-async function getCachedUsername(sender) {
-  const key = `ci_admin:${sender}`;
-  const cached = await redisClient.get(key);
-  if (cached) return cached;
-  const [rows] = await db.query("SELECT username FROM ci_admin WHERE mobile_no = ?", [sender]);
-  if (rows.length === 0) return null;
-  await redisClient.setex(key, CACHE_TTL, rows[0].username);
-  return rows[0].username;
-}
-
-async function getCachedWati(username) {
-  const key = `wati:${username}`;
+// The business number a webhook reports (sender_id) is registered in
+// wati / wati_branded as whatsapp_number (same as webhook.nuke.co.in), so the
+// username and its API config come from the same matching row.
+async function getCachedWatiAccount(sender) {
+  const key = `wati_account:${sender}`;
   const cached = await redisClient.get(key);
   if (cached) return JSON.parse(cached);
-  const [rows] = await db.query("SELECT url, api_key FROM wati WHERE username = ?", [username]);
-  if (rows.length === 0) return null;
-  await redisClient.setex(key, CACHE_TTL, JSON.stringify(rows[0]));
-  return rows[0];
+  for (const table of ["wati", "wati_branded"]) {
+    const [rows] = await db.query(
+      `SELECT username, url, api_key FROM ${table} WHERE whatsapp_number = ? ORDER BY id DESC LIMIT 1`,
+      [sender]
+    );
+    if (rows.length > 0) {
+      await redisClient.setex(key, CACHE_TTL, JSON.stringify(rows[0]));
+      return rows[0];
+    }
+  }
+  return null;
 }
 
 function buildWebhookFingerprint(data) {
@@ -241,8 +241,14 @@ async function processWebhookInBackground(data, ipAddress, userAgent) {
   }
 
   try {
+    /** ========================================================================
+     * ✅ STEP 1: GET USERNAME + API CONFIG FROM wati / wati_branded (Redis cached)
+     * ======================================================================== */
+    const watiConfig = await getCachedWatiAccount(sender);
+    username = watiConfig?.username || null;
+
     logToPM2({
-      username: 'system',
+      username: username || 'unknown',
       senderId: sender,
       receiverId: receiver,
       senderName: sendername,
@@ -260,10 +266,6 @@ async function processWebhookInBackground(data, ipAddress, userAgent) {
 
     // Session cleanup runs via background interval in app.js
 
-    /** ========================================================================
-     * ✅ STEP 1: GET USERNAME FROM ci_admin (Redis cached)
-     * ======================================================================== */
-    username = await getCachedUsername(sender);
     if (!username) {
       logToPM2({
         username: 'unknown',
@@ -272,7 +274,7 @@ async function processWebhookInBackground(data, ipAddress, userAgent) {
         senderName: sendername,
         logType: 'flow_not_found',
         logLevel: 'warning',
-        message: `No username found for sender: ${sender}`,
+        message: `No wati/wati_branded account found for sender: ${sender}`,
         userMessage: message,
         processingTime: (Date.now() - startTime) / 1000
       });
@@ -280,25 +282,6 @@ async function processWebhookInBackground(data, ipAddress, userAgent) {
     }
 
     logger.info(`✅ Username found: ${username}`);
-
-    /** ========================================================================
-     * ✅ STEP 2: GET WATI API CONFIGURATION (Redis cached)
-     * ======================================================================== */
-    const watiConfig = await getCachedWati(username);
-    if (!watiConfig) {
-      logToPM2({
-        username,
-        senderId: sender,
-        receiverId: receiver,
-        senderName: sendername,
-        logType: 'system_error',
-        logLevel: 'error',
-        message: `No WATI configuration found for username: ${username}`,
-        userMessage: message,
-        processingTime: (Date.now() - startTime) / 1000
-      });
-      return;
-    }
 
     const { url, api_key } = watiConfig;
     const META_API_URL = `${url}/messages`;
