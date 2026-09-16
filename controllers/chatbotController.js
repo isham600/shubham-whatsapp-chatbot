@@ -14,13 +14,16 @@ const WEBHOOK_DEDUPE_TTL_SECONDS = 15;
 // The business number a webhook reports (sender_id) is registered in
 // wati / wati_branded as whatsapp_number (same as webhook.nuke.co.in), so the
 // username and its API config come from the same matching row.
+// Backup rows (username ending in "_bk") share the number with the live
+// account, so they are used only when no live row exists.
 async function getCachedWatiAccount(sender) {
   const key = `wati_account:${sender}`;
   const cached = await redisClient.get(key);
   if (cached) return JSON.parse(cached);
   for (const table of ["wati", "wati_branded"]) {
     const [rows] = await db.query(
-      `SELECT username, url, api_key FROM ${table} WHERE whatsapp_number = ? ORDER BY id DESC LIMIT 1`,
+      `SELECT username, url, api_key FROM ${table} WHERE whatsapp_number = ?
+       ORDER BY (username LIKE '%\\_bk') ASC, id DESC LIMIT 1`,
       [sender]
     );
     if (rows.length > 0) {
