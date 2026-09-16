@@ -2101,7 +2101,11 @@ async function processQuestionNode(currentNode, receiver, apiUrl, accessToken, s
     const variableName = currentNode.data.variable || null;
     let questionType = "text";
 
-    if (!currentNode.data.answerOptions || currentNode.data.answerOptions === "[]") {
+    // answerOptions may be stored as a JSON string or as an array
+    const rawOptions = currentNode.data.answerOptions;
+    const answerOptions = typeof rawOptions === "string" ? JSON.parse(rawOptions || "[]") : (rawOptions || []);
+
+    if (!Array.isArray(answerOptions) || answerOptions.length === 0) {
       const message = currentNode.data.label;
       const finalMessage = await replaceVariables(message, sender, receiver, flowId, {}, sendername);
       
@@ -2132,7 +2136,7 @@ async function processQuestionNode(currentNode, receiver, apiUrl, accessToken, s
         null,
         currentNode.data.label,
         null,
-        currentNode.data.answerOptions,
+        answerOptions,
         sender,
         receiver,
         flowId,
@@ -2155,7 +2159,6 @@ async function processQuestionNode(currentNode, receiver, apiUrl, accessToken, s
       });
 
       const qBtnRes = await sendInteractiveMessage(apiUrl, payload, accessToken);
-      const answerOptions = JSON.parse(currentNode.data.answerOptions || '[]');
       saveChatMessage({
         username, senderId: sender, receiverId: receiver, senderName: sendername,
         type: 'button',
